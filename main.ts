@@ -1,137 +1,190 @@
-// token-radar-01 v3 — entrypoint.
-// Reads the sealed snapshot, builds the ranked board, writes the dashboard's data
-// into /output, copies dashboard/ and screenshots/ to /output, and writes
-// /output/dossier.json with buildDossier from vendor/makefun-board.ts.
-// Re-authored in this session from the spec in rebuild-v3/ROUND1.md.
+// Token Radar v4 — entrypoint (Node 22, stdlib only).
 //
-// Run: mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
+// Reads the sealed snapshot, builds the comps-4 board with lib/model.ts and
+// writes the graded outputs:
+//
+//   <out>/board.json        the ranked board (meta + 198 rows)
+//   <out>/dashboard/        index.html + app.css + app.js + data.js
+//   <out>/screenshots/      the three dashboard screenshots (copied)
+//   <out>/dossier.json      buildDossier output over dashboard + screenshots
+//
+// Run from the repo root:
+//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input <snapshot.json>
+//
+// The run is deterministic: no clock, no randomness, no network. Running it
+// twice writes the same bytes.
 
-import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { buildBoard } from './lib/model.ts';
-import { buildDossier } from './vendor/makefun-board.ts';
-import type { Snapshot } from './lib/model.ts';
+import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildDossier } from "./vendor/makefun-board.ts";
+import { buildBoard, type Snap } from "./lib/model.ts";
 
-const root = dirname(fileURLToPath(import.meta.url));
+const repoRoot = dirname(fileURLToPath(import.meta.url));
 
-function argValue(flag: string): string | undefined {
-  const i = process.argv.indexOf(flag);
-  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
+function arg(name: string, fallback: string): string {
+  const i = process.argv.indexOf(name);
+  if (i >= 0 && i + 1 < process.argv.length) return process.argv[i + 1];
+  return fallback;
 }
 
-const inputPath =
-  argValue('--input') ??
-  process.env.MAKEFUN_INPUT ??
-  (existsSync('/input/snapshot.json') ? '/input/snapshot.json' : 'input/snapshot.json');
-const outDir =
-  argValue('--output') ?? process.env.MAKEFUN_OUTPUT_DIR ?? 'out';
-
-const snap = JSON.parse(readFileSync(inputPath, 'utf8')) as Snapshot;
-const { rows, marketMedian, totalImplied, liveTokenCount, liveTokenTop } = buildBoard(snap);
-
-// Self-checks: a bad board fails loudly here, never silently.
-if (rows.length < 100) throw new Error(`board too small: ${rows.length} rows`);
-for (let i = 0; i < rows.length; i++) {
-  if (rows[i].rank !== i + 1) throw new Error(`rank break at ${i}`);
-  if (i > 0 && rows[i].implied_value_usd > rows[i - 1].implied_value_usd) {
-    throw new Error(`implied value rises at rank ${rows[i].rank}`);
-  }
-  if (rows[i].farm_steps.length < 3 || rows[i].farm_steps.length > 12) {
-    throw new Error(`farm_steps count at rank ${rows[i].rank}`);
-  }
-  for (const s of rows[i].farm_steps) {
-    if (s.trim().length < 20 || s.trim().length > 600) {
-      throw new Error(`farm step length at rank ${rows[i].rank}`);
-    }
-  }
-}
-const watchCovered = rows.filter((r) => r.watchlist).length;
-if (watchCovered !== snap.watchlist.length) {
-  throw new Error(`watchlist coverage ${watchCovered}/${snap.watchlist.length}`);
-}
-
-mkdirSync(join(outDir, 'dashboard'), { recursive: true });
-mkdirSync(join(outDir, 'screenshots'), { recursive: true });
-
-// board.json: the ranked board, plus the model's headline numbers.
-writeFileSync(
-  join(outDir, 'board.json'),
-  JSON.stringify({
-    rows,
-    meta: {
-      market_median: marketMedian,
-      shrinkage_k: 3,
-      rows: rows.length,
-      total_implied_usd: totalImplied,
-      as_of: snap.as_of,
-    },
-  }),
+const inputPath = arg("--input", "/input/snapshot.json");
+const outDir = resolve(
+  arg("--output", process.env.MAKEFUN_OUTPUT_DIR ?? "/output")
 );
 
-// Dashboard data, compact positional rows so the dossier's source text stays
-// whole under its 65,536-byte cap. Schema (decoded in dashboard/app.js):
-//   cats: category names by index
-//   rows: [slug, name, catIdx, chainsPipe (first 3, "|" joined), chainCount,
-//          tvl, change_7d|null, age_days|null, multiple, implied, watch 1/0,
-//          category_median, peers, growth, maturity, chain]
-//   liveTop: [name, category, tvl, symbol] of the largest live-token protocols,
-//   shown set aside, never ranked.
-const cats: string[] = [];
-const catIdx = new Map<string, number>();
+const snap = JSON.parse(readFileSync(inputPath, "utf8")) as Snap;
+const { rows, meta } = buildBoard(snap);
+
+// ---- self-checks (the gate's shape, checked before anything is written)
+if (rows.length < 100 || rows.length > 4000) {
+  throw new Error(`board has ${rows.length} rows, outside 100-4000`);
+}
+rows.forEach((r, i) => {
+  if (r.rank !== i + 1) throw new Error(`rank break at ${r.slug}`);
+  if (i > 0 && r.implied_value_usd > rows[i - 1].implied_value_usd) {
+    throw new Error(`implied rises at rank ${r.rank}`);
+  }
+  if (r.farm_steps.length < 3 || r.farm_steps.length > 12) {
+    throw new Error(`farm_steps count ${r.farm_steps.length} at ${r.slug}`);
+  }
+  for (const s of r.farm_steps) {
+    const t = s.trim();
+    if (t.length < 20 || t.length > 600) {
+      throw new Error(`farm step length ${t.length} at ${r.slug}`);
+    }
+  }
+});
+const watchCovered = rows.filter((r) => r.watchlist).length;
+if (watchCovered !== snap.watchlist.length) {
+  throw new Error(`watchlist ${watchCovered}/${snap.watchlist.length}`);
+}
+if (new Set(rows.map((r) => r.implied_value_usd)).size === 1) {
+  throw new Error("all implied values identical — not a ranking");
+}
+
+// ---- compact positional rows for the dashboard (keeps the dossier small)
+// [slug, name, catIdx, chainsJoined, tvl, chg, age, mult, imp, watch]
+// The P25-P75 band is NOT stored per row: the page recomputes it as
+// imp x residP25 / residP75 from meta (the same ratios board.json used).
+const catNames: string[] = [];
+const catIndex = new Map<string, number>();
 for (const r of rows) {
-  const c = r.category ?? '';
-  if (!catIdx.has(c)) {
-    catIdx.set(c, cats.length);
-    cats.push(c);
+  const c = r.category ?? "(none)";
+  if (!catIndex.has(c)) {
+    catIndex.set(c, catNames.length);
+    catNames.push(c);
   }
 }
 const compactRows = rows.map((r) => [
   r.slug,
   r.name,
-  catIdx.get(r.category ?? '') ?? 0,
-  r.chains.slice(0, 3).join('|'),
-  r.chains.length,
+  catIndex.get(r.category ?? "(none)") as number,
+  r.chains.join("|"),
   r.tvl_usd,
   r.change_7d,
   r.age_days,
   r.multiple,
   r.implied_value_usd,
   r.watchlist ? 1 : 0,
-  r.model.category_median,
-  r.model.peers,
-  r.model.growth,
-  r.model.maturity,
-  r.model.chain,
 ]);
-const data = {
-  cats,
-  M: marketMedian,
-  k: 3,
-  total: totalImplied,
-  liveCount: liveTokenCount,
-  liveTop: liveTokenTop.map((p) => [p.name, p.category ?? '', p.tvl_usd, p.symbol ?? '']),
+// [name, comps, rawDex, adjDex, factor] per comps category (sorted by name).
+const compactCats = meta.categories.map((c) => [
+  c.name,
+  c.comps,
+  c.rawDex,
+  c.adjDex,
+  c.factor,
+]);
+// Farm ticket per row is NOT stored: the page recomputes it from the row's
+// own TVL tier and age with the same tierOf/holdDaysOf rules (see app.js).
+// Live-token protocols set aside, top 12 by mcap (name, category, tvl, mcap).
+const liveTop = snap.protocols
+  .filter((p) => p.mcap_usd !== null && p.mcap_usd > 0)
+  .sort((a, b) => (b.mcap_usd as number) - (a.mcap_usd as number))
+  .slice(0, 12)
+  .map((p) => [p.name, p.category ?? "(none)", p.tvl_usd, p.mcap_usd]);
+
+const boardData = {
+  meta: {
+    rows: meta.rows,
+    totalImplied: meta.totalImplied,
+    asOf: meta.asOf,
+    comps: meta.comps,
+    excludedPlaceholder: meta.excludedPlaceholder,
+    curveA: meta.curveA,
+    curveB: meta.curveB,
+    level100m: meta.level100m,
+    looX: meta.looX,
+    flatX: meta.flatX,
+    residP25: meta.residP25,
+    residP75: meta.residP75,
+    liveToken: meta.liveToken,
+    setAside: meta.setAside,
+    watchlistN: meta.watchlistN,
+  },
+  cats: catNames,
+  effects: compactCats,
+  liveTop,
   rows: compactRows,
 };
-const dataJson = JSON.stringify(data);
 
-const indexHtml = readFileSync(join(root, 'dashboard', 'index.html'), 'utf8');
-const appCss = readFileSync(join(root, 'dashboard', 'app.css'), 'utf8');
-let appJs = readFileSync(join(root, 'dashboard', 'app.js'), 'utf8');
-const placeholderCount = appJs.split('__BOARD_DATA_JSON__').length - 1;
-if (placeholderCount !== 1) {
-  throw new Error(`__BOARD_DATA_JSON__ appears ${placeholderCount} times in app.js (must be 1)`);
+// ---- write outputs
+mkdirSync(outDir, { recursive: true });
+mkdirSync(join(outDir, "dashboard"), { recursive: true });
+mkdirSync(join(outDir, "screenshots"), { recursive: true });
+writeFileSync(
+  join(outDir, "board.json"),
+  JSON.stringify({ meta, rows }, null, 2) + "\n",
+  "utf8"
+);
+writeFileSync(
+  join(outDir, "dashboard", "data.js"),
+  "window.BOARD=" + JSON.stringify(boardData) + ";\n",
+  "utf8"
+);
+for (const f of ["index.html", "app.css", "app.js"]) {
+  cpSync(join(repoRoot, "dashboard", f), join(outDir, "dashboard", f));
 }
-appJs = appJs.replace('__BOARD_DATA_JSON__', dataJson);
-
-writeFileSync(join(outDir, 'dashboard', 'index.html'), indexHtml);
-writeFileSync(join(outDir, 'dashboard', 'app.css'), appCss);
-writeFileSync(join(outDir, 'dashboard', 'app.js'), appJs);
-cpSync(join(root, 'screenshots'), join(outDir, 'screenshots'), { recursive: true });
-
+const shotsDir = join(repoRoot, "screenshots");
+if (existsSync(shotsDir)) {
+  cpSync(shotsDir, join(outDir, "screenshots"), { recursive: true });
+}
 const dossier = buildDossier(outDir, { text_max_bytes: 65536 });
-writeFileSync(join(outDir, 'dossier.json'), dossier);
+writeFileSync(join(outDir, "dossier.json"), dossier);
 
-console.log(`board: ${rows.length} rows, total implied $${totalImplied.toLocaleString('en-US')}`);
-console.log(`market median ${marketMedian}, top: ${rows.slice(0, 3).map((r) => r.name).join(', ')}`);
-console.log(`dossier: ${dossier.length} bytes`);
+// Dossier text must fit whole: buildDossier cuts files past the cap and
+// leaves a "[Cut at" line instead of failing, so detect the cut itself.
+const parsed = JSON.parse(new TextDecoder().decode(dossier)) as {
+  text?: string;
+};
+const textBytes = parsed.text
+  ? new TextEncoder().encode(parsed.text).length
+  : -1;
+if (textBytes > 65536 || (parsed.text ?? "").includes("[Cut at")) {
+  throw new Error(
+    `dossier text cut or over cap (${textBytes} B) — dashboard source must fit whole under 65536`
+  );
+}
+
+console.log(
+  `${rows.length} rows scored (${meta.watchlistN} watchlist, ${
+    rows.length - meta.watchlistN
+  } early, ${meta.liveToken} live set aside)`
+);
+console.log(
+  `total implied $${meta.totalImplied.toLocaleString("en-US")} | ` +
+    `curve log10(mcap) = ${meta.curveA} + ${meta.curveB} * log10(tvl) | ` +
+    `level @ $100M ${meta.level100m}x | LOO x${meta.looX} vs flat x${meta.flatX}`
+);
+console.log(
+  "top 3: " +
+    rows
+      .slice(0, 3)
+      .map((r) => `${r.name} $${r.implied_value_usd.toLocaleString("en-US")}`)
+      .join(" / ")
+);
+console.log(
+  `dossier ${dossier.length} B, text ${textBytes} B (cap 65536), ` +
+    `dashboard files copied, screenshots copied`
+);

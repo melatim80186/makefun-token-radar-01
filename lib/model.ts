@@ -1,9 +1,25 @@
-// token-radar-01 v3 — model: board builder + farm-step generator.
-// Pure TypeScript: no Node APIs, no network, no hardcoded protocol names.
-// The board is derived from the snapshot's own figures only.
-// Re-authored in this session from the spec in rebuild-v3/ROUND1.md.
+// Token Radar v4 — comps-4 model (pure TS, no Node APIs).
+//
+// The implied value of a pre-token protocol is priced off the market's own
+// curve: the 128 snapshot protocols whose token already trades give a
+// log-log fit of market cap on TVL, and each category's effect is its mean
+// log-residual, shrunk toward the curve with 4 pseudo-comps. Nothing is
+// hardcoded by protocol name or by category: every number below is fitted
+// from the sealed snapshot at run time.
+//
+//   log10(mcap) = a + b * log10(tvl)          (OLS over the 128 comps)
+//   multiple    = 10^(a + b*log10(tvl) + adj_category) / tvl
+//   implied     = round(tvl * multiple * growth * maturity * chain)
+//
+// growth   = 1 + clamp(change_7d, -50, 100) / 100 * 0.5   (null -> 0)
+// maturity = 0.6 + min(age_days, 1095) / 1095 * 0.4        (null age -> 365d)
+// chain    = 1 + 0.02 * min(chains - 1, 5)
+//
+// Uncertainty: P25/P75 of the comps' actual/predicted ratios, applied to the
+// implied value. Validation: exact leave-one-out refit per comp, median
+// |log10 error|, against a flat-median-ratio baseline.
 
-export interface SnapshotProtocol {
+export interface Proto {
   slug: string;
   name: string;
   category: string | null;
@@ -16,22 +32,48 @@ export interface SnapshotProtocol {
   symbol: string | null;
 }
 
-export interface Snapshot {
+export interface Snap {
   as_of: string;
   source: string;
   floor_usd: number;
-  protocols: SnapshotProtocol[];
+  protocols: Proto[];
   watchlist: string[];
 }
 
-export interface ModelFactors {
-  category_median: number;
-  peers: number;
-  market_median: number;
-  shrinkage_k: number;
+export interface CatEffect {
+  name: string;
+  comps: number;
+  rawDex: number;
+  adjDex: number;
+  factor: number;
+}
+
+export interface Fit {
+  comps: number;
+  excludedPlaceholder: number;
+  a: number;
+  b: number;
+  level100m: number;
+  looX: number;
+  flatX: number;
+  flatRatio: number;
+  residP25: number;
+  residP75: number;
+  effects: CatEffect[];
+}
+
+export interface RowModel {
+  catPeers: number;
+  catAdjDex: number;
   growth: number;
   maturity: number;
   chain: number;
+}
+
+export interface Ticket {
+  usd: number;
+  holdDays: number;
+  setupMin: number;
 }
 
 export interface BoardRow {
@@ -44,406 +86,489 @@ export interface BoardRow {
   age_days: number | null;
   multiple: number;
   implied_value_usd: number;
+  implied_lo_usd: number;
+  implied_hi_usd: number;
   rank: number;
   watchlist: boolean;
-  model: ModelFactors;
+  model: RowModel;
   farm_steps: string[];
+  ticket: Ticket;
 }
 
-// Categories the house's watchlist rule sets aside: a protocol in one of these
-// records no token, but the category itself is a wrapped, staked or bridged product
-// of a token that already trades (or an exchange). The same tests decide the board:
-// the watchlist is the floor, never the ceiling, and a board may rank protocols the
-// watchlist leaves out — but a wrapped/staked/bridged product is not a launch.
-export const EXCLUDED_CATEGORIES = new Set([
-  'Bridge',
-  'Canonical Bridge',
-  'Liquid Staking',
-  'Liquid Restaking',
-  'Restaked BTC',
-  'CEX',
-]);
+export interface BoardMeta {
+  rows: number;
+  totalImplied: number;
+  asOf: string;
+  comps: number;
+  excludedPlaceholder: number;
+  curveA: number;
+  curveB: number;
+  level100m: number;
+  looX: number;
+  flatX: number;
+  residP25: number;
+  residP75: number;
+  liveToken: number;
+  setAside: number;
+  watchlistN: number;
+  categories: CatEffect[];
+}
 
-const EXCHANGE_NAMES = new Set([
-  'binance',
-  'coinbase',
-  'bybit',
-  'kraken',
-  'bitget',
-  'okx',
-  'bitfinex',
-  'gemini',
-]);
+export const SHRINK_K = 4;
+export const AGE_DEFAULT_DAYS = 365;
+export const AGE_CAP_DAYS = 1095;
 
-const VERSION_MARKER = /\s(v\d+|V\d+|\d+\.\d+)\s*$/;
-
-export const SHRINKAGE_K = 3;
-export const PEER_RATIO_CAP = 2.0;
-export const MULTIPLE_FLOOR = 0.02;
+// ---------------------------------------------------------------- numbers
 
 export function round4(x: number): number {
-  return Math.round(x * 10000) / 10000;
+  return Math.floor(x * 10000 + 0.5) / 10000;
 }
 
-export function median(values: number[]): number {
-  const s = [...values].sort((a, b) => a - b);
+export function median(xs: number[]): number {
+  const s = [...xs].sort((p, q) => p - q);
   const n = s.length;
-  if (n === 0) return NaN;
-  const mid = Math.floor(n / 2);
-  return n % 2 === 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+  if (n === 0) return 0;
+  if (n % 2 === 1) return s[(n - 1) / 2];
+  return (s[n / 2 - 1] + s[n / 2]) / 2;
 }
 
-function isPreToken(p: SnapshotProtocol): boolean {
+function clamp(x: number, lo: number, hi: number): number {
+  return x < lo ? lo : x > hi ? hi : x;
+}
+
+function log10(x: number): number {
+  return Math.log(x) / Math.LN10;
+}
+
+// ---------------------------------------------------------------- eligibility
+
+const EXCLUDED_CATEGORIES = new Set([
+  "Bridge",
+  "Canonical Bridge",
+  "Liquid Staking",
+  "Liquid Restaking",
+  "Restaked BTC",
+  "CEX",
+]);
+
+const EXCHANGE_PREFIXES = [
+  "Binance",
+  "Coinbase",
+  "Bybit",
+  "Kraken",
+  "Bitget",
+  "OKX",
+  "Bitfinex",
+  "Gemini",
+];
+
+const VERSION_MARKER = /\s+(V\d+|v\d+|\d+\.\d+(\.\d+)?)$/;
+
+export function isPreToken(p: Proto): boolean {
   return p.gecko_id === null && p.symbol === null;
 }
 
-function isExcludedProduct(p: SnapshotProtocol): boolean {
-  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return true;
-  const name = p.name || '';
-  if (VERSION_MARKER.test(name)) return true;
-  const words = new Set(name.toLowerCase().split(/\s+/));
-  if (words.has('wrapped') || words.has('staked') || words.has('staking')) return true;
-  const first = name.toLowerCase().split(' ')[0];
-  if (EXCHANGE_NAMES.has(first)) return true;
-  return false;
-}
-
-/** The board's subjects: the watchlist as given, plus every pre-token protocol
- *  below the floor that is not a wrapped/staked/bridged product. The rule itself
- *  decides the board; no TVL cutoff beyond it, no list of names. */
-export function boardSubjects(snap: Snapshot): SnapshotProtocol[] {
-  const wl = new Set(snap.watchlist);
-  const bySlug = new Map(snap.protocols.map((p) => [p.slug, p]));
-  const out: SnapshotProtocol[] = [];
-  for (const slug of snap.watchlist) {
-    const p = bySlug.get(slug);
-    if (p) out.push(p);
+export function isEligible(p: Proto): boolean {
+  if (!isPreToken(p)) return false;
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
+  if (VERSION_MARKER.test(p.name)) return false;
+  const words = p.name.toLowerCase().split(/[^A-Za-z]+/);
+  if (words.includes("wrapped") || words.includes("staked") || words.includes("staking")) return false;
+  for (const ex of EXCHANGE_PREFIXES) {
+    if (p.name.startsWith(ex)) return false;
   }
-  for (const p of snap.protocols) {
-    if (wl.has(p.slug)) continue;
-    if (!isPreToken(p)) continue;
-    if (isExcludedProduct(p)) continue;
-    out.push(p);
+  return true;
+}
+
+// ---------------------------------------------------------------- comps fit
+
+export function fitCurve(snap: Snap): Fit {
+  const comps = snap.protocols.filter(
+    (p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0
+  );
+  const excludedPlaceholder = snap.protocols.filter(
+    (p) => p.mcap_usd !== null && p.mcap_usd <= 0
+  ).length;
+  const n = comps.length;
+  const xs = comps.map((p) => log10(p.tvl_usd));
+  const ys = comps.map((p) => log10(p.mcap_usd as number));
+  const mx = xs.reduce((s, x) => s + x, 0) / n;
+  const my = ys.reduce((s, y) => s + y, 0) / n;
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sxx += (xs[i] - mx) * (xs[i] - mx);
+    sxy += (xs[i] - mx) * (ys[i] - my);
   }
-  return out;
+  const b = sxy / sxx;
+  const a = my - b * mx;
+  const resid = ys.map((y, i) => y - (a + b * xs[i]));
+
+  // Category effects: mean residual, shrunk toward 0 with SHRINK_K pseudo-comps.
+  const byCat = new Map<string, number[]>();
+  comps.forEach((p, i) => {
+    const c = p.category === null ? "(none)" : p.category;
+    if (!byCat.has(c)) byCat.set(c, []);
+    byCat.get(c)!.push(resid[i]);
+  });
+  const effects: CatEffect[] = [];
+  for (const [name, rs] of [...byCat.entries()].sort((p, q) => (p[0] < q[0] ? -1 : 1))) {
+    const sum = rs.reduce((s, r) => s + r, 0);
+    const raw = sum / rs.length;
+    const adj = sum / (rs.length + SHRINK_K);
+    effects.push({
+      name,
+      comps: rs.length,
+      rawDex: round4(raw),
+      adjDex: round4(adj),
+      factor: round4(Math.pow(10, adj)),
+    });
+  }
+
+  // Exact leave-one-out refit per comp (closed-form OLS sums).
+  const sx = xs.reduce((s, x) => s + x, 0);
+  const sy = ys.reduce((s, y) => s + y, 0);
+  const sxxRaw = xs.reduce((s, x) => s + x * x, 0);
+  const sxyRaw = xs.reduce((s, x, i) => s + x * ys[i], 0);
+  const looErrs: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const nn = n - 1;
+    const mxx = (sx - xs[i]) / nn;
+    const myy = (sy - ys[i]) / nn;
+    const bb =
+      (sxyRaw - xs[i] * ys[i] - nn * mxx * myy) /
+      (sxxRaw - xs[i] * xs[i] - nn * mxx * mxx);
+    const aa = myy - bb * mxx;
+    looErrs.push(Math.abs(ys[i] - (aa + bb * xs[i])));
+  }
+  const looX = Math.pow(10, median(looErrs));
+
+  // Flat baseline: the median mcap/tvl ratio, same comps.
+  const ratios = comps.map((p) => (p.mcap_usd as number) / p.tvl_usd);
+  const flatRatio = median(ratios);
+  const flatErrs = comps.map((p) =>
+    Math.abs(log10((p.mcap_usd as number) / (flatRatio * p.tvl_usd)))
+  );
+  const flatX = Math.pow(10, median(flatErrs));
+
+  // Residual-ratio quantiles for the P25-P75 band (indices n/4 and 3n/4).
+  const rr = resid.map((r) => Math.pow(10, r)).sort((p, q) => p - q);
+  const residP25 = rr[Math.floor(n / 4)];
+  const residP75 = rr[Math.floor((3 * n) / 4)];
+
+  return {
+    comps: n,
+    excludedPlaceholder,
+    a,
+    b,
+    level100m: Math.pow(10, a + b * 8) / 1e8,
+    looX,
+    flatX,
+    flatRatio,
+    residP25,
+    residP75,
+    effects,
+  };
 }
 
-function ageDays(asOf: string, listedAt: string | null): { age: number; out: number | null } {
-  if (!listedAt) return { age: 365, out: null };
-  const day = 86400000;
-  const a = Date.parse(asOf + 'T00:00:00Z');
-  const b = Date.parse(listedAt + 'T00:00:00Z');
-  const age = Math.max(0, Math.round((a - b) / day));
-  return { age, out: age };
+// ---------------------------------------------------------------- factors
+
+export function ageDays(listedAt: string | null, asOf: string): number | null {
+  if (listedAt === null) return null;
+  const t0 = Date.parse(listedAt + "T00:00:00Z");
+  const t1 = Date.parse(asOf + "T00:00:00Z");
+  return Math.round((t1 - t0) / 86400000);
 }
 
-function article(name: string): string {
-  const c = (name || '').slice(0, 1).toLowerCase();
-  return c === 'a' || c === 'e' || c === 'i' || c === 'o' || c === 'u' ? 'an' : 'a';
+export function factors(p: Proto, asOf: string): {
+  age: number | null;
+  growth: number;
+  maturity: number;
+  chain: number;
+} {
+  const age = ageDays(p.listed_at, asOf);
+  const effAge = age === null ? AGE_DEFAULT_DAYS : age;
+  const chg = p.change_7d === null ? 0 : p.change_7d;
+  return {
+    age,
+    growth: 1 + (clamp(chg, -50, 100) / 100) * 0.5,
+    maturity: 0.6 + (Math.min(effAge, AGE_CAP_DAYS) / AGE_CAP_DAYS) * 0.4,
+    chain: 1 + 0.02 * Math.min(p.chains.length - 1, 5),
+  };
 }
 
-interface CatPlan {
-  step2: string;
-  venue: string;
+// ---------------------------------------------------------------- farm plans
+
+export interface CatPlan {
+  first: string;
   weekly: string;
 }
 
-const CAT: Record<string, CatPlan> = {
-  'Risk Curators': {
-    step2: 'Deposit ${amt} into {art} {name} vault on {chain} and keep the shares.',
-    venue: 'vaults',
-    weekly: 'a deposit, a vote or a rebalance',
-  },
-  'Onchain Capital Allocator': {
-    step2: 'Deposit ${amt} into {art} {name} vault on {chain} and keep the shares.',
-    venue: 'vaults',
-    weekly: 'a deposit, a withdrawal or a vote',
+// One entry per board category: the mechanism-specific first move and the
+// weekly action. Phrasing is the entry's own; amounts, chains and hold days
+// come from the row's own figures.
+export const CAT_PLAN: Record<string, CatPlan> = {
+  "Risk Curators": {
+    first: "Open the curator vault on {chain} and read its strategy, fees, lock terms and past performance before depositing anything.",
+    weekly: "check the vault's allocation and rebalance notes",
   },
   Dexs: {
-    step2: 'Swap ${amt} through {name} on {chain} and add ${amt2} of liquidity to its deepest pool.',
-    venue: 'pools',
-    weekly: 'a swap, a liquidity add or a vote',
+    first: "Open the swap page on {chain} and place a small test swap to confirm the pool, the route and the slippage.",
+    weekly: "swap a small amount or add liquidity to keep volume on the pair",
   },
-  Lending: {
-    step2: 'Supply ${amt} of stablecoins to {name} on {chain} and borrow ${amt2} against the supply.',
-    venue: 'markets',
-    weekly: 'a supply, a borrow or a repayment',
-  },
-  'Prediction Market': {
-    step2: 'Place ${amt} across two outcomes on {name} on {chain} and leave both positions open.',
-    venue: 'markets',
-    weekly: 'a new bet, a cash-out or a vote',
-  },
-  CDP: {
-    step2: 'Mint ${amt} of the stablecoin by locking collateral in {name} on {chain}.',
-    venue: 'vaults',
-    weekly: 'a mint, a repayment or a collateral top-up',
-  },
-  'CDP Manager': {
-    step2: 'Open a ${amt} vault in {name} on {chain} and manage the collateral ratio weekly.',
-    venue: 'vaults',
-    weekly: 'a vault rebalance, a repayment or a top-up',
+  "Onchain Capital Allocator": {
+    first: "Open the allocator vault on {chain} and read the mandate, the fee schedule and the redemption terms.",
+    weekly: "review the vault's positions and reported yield",
   },
   RWA: {
-    step2: 'Buy ${amt} of the tokenised asset on {name} on {chain} and hold the receipt.',
-    venue: 'holdings',
-    weekly: 'a buy, a redemption or a vote',
+    first: "Open the tokenised-asset page on {chain} and read the issuer, the custodian and the redemption terms.",
+    weekly: "check new asset listings and your accrued yield",
+  },
+  Lending: {
+    first: "Open the lending market on {chain} and supply a small test amount to confirm the rates and that withdrawal works.",
+    weekly: "supply or borrow a small amount and check your health factor",
   },
   Yield: {
-    step2: 'Deposit ${amt} into the highest-yield {name} vault on {chain}.',
-    venue: 'vaults',
-    weekly: 'a deposit, a harvest or a vault switch',
-  },
-  'Yield Aggregator': {
-    step2: 'Deposit ${amt} into the highest-yield {name} vault on {chain}.',
-    venue: 'vaults',
-    weekly: 'a deposit, a harvest or a vault switch',
+    first: "Open the yield strategy on {chain} and read how the yield is generated and what it costs.",
+    weekly: "harvest or compound the yield",
   },
   Derivatives: {
-    step2: 'Open one small hedged position of ${amt} on {name} on {chain}.',
-    venue: 'positions',
-    weekly: 'a hedge, a close or a rebalance',
+    first: "Open the perps market on {chain} and place a small test trade to confirm margin, fees and the liquidation rules.",
+    weekly: "open or close a small position within your risk limit",
   },
-  'Basis Trading': {
-    step2: 'Open a ${amt} basis position on {name} on {chain} and hold it through one funding cycle.',
-    venue: 'positions',
-    weekly: 'a basis open, a close or a roll',
+  CDP: {
+    first: "Open the vault on {chain} and mint a small amount of the stable asset against collateral to test the flow.",
+    weekly: "check your collateral ratio and top it up if it drifts",
+  },
+  "Yield Aggregator": {
+    first: "Open the vault on {chain} and deposit a test amount to confirm the strategy and the fees.",
+    weekly: "check the vault's strategy return and compound",
+  },
+  "Basis Trading": {
+    first: "Open the basis strategy on {chain} and read how the hedge is held and what it pays.",
+    weekly: "check the funding rate and your position's carry",
   },
   Chain: {
-    step2: 'Use ${amt} across two apps on {name} on {chain} and keep the wallet active.',
-    venue: 'apps',
-    weekly: 'an app use, a swap or a vote',
+    first: "Open the chain's bridge page on {chain} and move a small test amount to confirm the route and the fees.",
+    weekly: "bridge or transact a small amount to keep the wallet active",
   },
-  'Staking Pool': {
-    step2: 'Stake ${amt} in the {name} pool on {chain} and keep the stake through one epoch.',
-    venue: 'pools',
-    weekly: 'a stake, an unstake or a claim',
+  "Liquidity Manager": {
+    first: "Open the managed position on {chain} and deposit a test amount to confirm the range and the fees.",
+    weekly: "check the position's range and rebalance if it drifts out",
   },
-  'Liquidity Manager': {
-    step2: 'Deposit ${amt} into a {name} managed position on {chain}.',
-    venue: 'positions',
-    weekly: 'a deposit, a rebalance or a withdrawal',
+  "Staking Pool": {
+    first: "Open the staking page on {chain} and stake a small test amount to confirm the rewards and the unstake delay.",
+    weekly: "check accrued staking rewards and restake or claim",
   },
-  'Leveraged Farming': {
-    step2: 'Open a ${amt} leveraged farm on {name} on {chain} at low leverage.',
-    venue: 'farms',
-    weekly: 'a farm open, a harvest or a deleverage',
+  "Prediction Market": {
+    first: "Open the market page on {chain} and place a small test trade to confirm the market, the fees and settlement.",
+    weekly: "trade a small position on a market you follow",
+  },
+  "Stablecoin Wrapper": {
+    first: "Open the wrapper on {chain} and convert a small test amount to confirm the rate and redemption.",
+    weekly: "wrap or unwrap a small amount to keep the flow active",
   },
   Restaking: {
-    step2: 'Restake ${amt} through {name} on {chain} and keep the position through one epoch.',
-    venue: 'positions',
-    weekly: 'a restake, a claim or a withdrawal',
-  },
-  'Anchor BTC': {
-    step2: 'Lock ${amt} of BTC value in {name} on {chain} and hold the receipt.',
-    venue: 'vaults',
-    weekly: 'a lock, a mint or a redemption',
-  },
-  'Decentralized BTC': {
-    step2: 'Lock ${amt} of BTC value in {name} on {chain} and hold the receipt.',
-    venue: 'vaults',
-    weekly: 'a lock, a mint or a redemption',
+    first: "Open the restaking page on {chain} and restake a small test amount to confirm the operator and the rewards.",
+    weekly: "check restaking rewards and the operator's performance",
   },
   CeDeFi: {
-    step2: 'Deposit ${amt} into {name} on {chain} and use one of its CeDeFi vaults.',
-    venue: 'vaults',
-    weekly: 'a deposit, a vault use or a withdrawal',
-  },
-  'Dual-Token Stablecoin': {
-    step2: 'Mint ${amt} of the stablecoin pair on {name} on {chain}.',
-    venue: 'vaults',
-    weekly: 'a mint, a burn or a swap',
-  },
-  'Uncollateralized Lending': {
-    step2: 'Lend ${amt} through {name} on {chain} to one borrower pool.',
-    venue: 'pools',
-    weekly: 'a lend, a repayment or a claim',
-  },
-  'Interest Rate Derivatives': {
-    step2: 'Open a ${amt} rate position on {name} on {chain}.',
-    venue: 'positions',
-    weekly: 'a rate open, a close or a roll',
-  },
-  Insurance: {
-    step2: 'Buy ${amt} of cover on {name} on {chain} for one of its listed protocols.',
-    venue: 'policies',
-    weekly: 'a cover buy, a claim or a renewal',
+    first: "Open the CeDeFi product on {chain} and read the custodian, the yield source and the withdrawal terms.",
+    weekly: "check your balance and any new yield product",
   },
   Farm: {
-    step2: 'Deposit ${amt} into the top farm on {name} on {chain}.',
-    venue: 'farms',
-    weekly: 'a deposit, a harvest or a farm switch',
+    first: "Open the farm on {chain} and stake a small test amount to confirm the reward rate and the lock.",
+    weekly: "harvest farm rewards and restake",
+  },
+  "Anchor BTC": {
+    first: "Open the BTC vault on {chain} and deposit a small test amount to confirm the peg and redemption.",
+    weekly: "check the BTC backing and your position",
+  },
+  "Leveraged Farming": {
+    first: "Open the leveraged farm on {chain} and read the leverage, the liquidation price and the fees before depositing.",
+    weekly: "check your leveraged position's health and deleverage if needed",
+  },
+  "Decentralized BTC": {
+    first: "Open the BTC product on {chain} and test a small mint or deposit to confirm the flow.",
+    weekly: "check the BTC reserve proof and your balance",
+  },
+  "Dual-Token Stablecoin": {
+    first: "Open the stablecoin page on {chain} and mint a small test amount to confirm the collateral and the peg.",
+    weekly: "check the peg and your collateral ratio",
+  },
+  "Collateral Markets": {
+    first: "Open the collateral market on {chain} and supply a small test amount to confirm the terms.",
+    weekly: "check your supplied collateral and borrow usage",
+  },
+  "CDP Manager": {
+    first: "Open the CDP manager on {chain} and open a small test vault to confirm the flow.",
+    weekly: "check your vaults' collateral ratios",
   },
   Payments: {
-    step2: 'Send ${amt} through {name} on {chain} and keep the wallet active weekly.',
-    venue: 'payments',
-    weekly: 'a payment, a top-up or a vote',
+    first: "Open the payments page on {chain} and send a small test payment to confirm the fees and the speed.",
+    weekly: "send or receive a small payment",
   },
-  'Governance Incentives': {
-    step2: 'Lock ${amt} in governance on {name} on {chain} and vote on one proposal.',
-    venue: 'votes',
-    weekly: 'a lock, a vote or a claim',
+  "Cross Chain Bridge": {
+    first: "Open the bridge on {chain} and move a small test amount to confirm the route and the arrival time.",
+    weekly: "bridge a small amount to keep the route warm",
   },
-  'Crypto Card Issuer': {
-    step2: 'Spend ${amt} through the {name} card on {chain} and keep the card active.',
-    venue: 'payments',
-    weekly: 'a spend, a top-up or a vote',
+  "OTC Marketplace": {
+    first: "Open the OTC desk on {chain} and read the listing, escrow and settlement terms.",
+    weekly: "check new OTC listings",
   },
-  'Stablecoin Wrapper': {
-    step2: 'Wrap ${amt} through {name} on {chain} and hold the wrapped balance.',
-    venue: 'balances',
-    weekly: 'a wrap, an unwrap or a swap',
+  Insurance: {
+    first: "Open the cover page on {chain} and read the cover terms, the premium and the claim process.",
+    weekly: "check your cover's expiry and renew if needed",
+  },
+  "Governance Incentives": {
+    first: "Open the governance page on {chain} and read the proposal and reward terms.",
+    weekly: "vote on a live proposal or check rewards",
+  },
+  "Crypto Card Issuer": {
+    first: "Open the card page on {chain} and read the card fees, limits and cashback terms.",
+    weekly: "spend a small amount on the card to keep it active",
+  },
+  "Uncollateralized Lending": {
+    first: "Open the credit market on {chain} and read the borrower terms and the credit limits.",
+    weekly: "check your credit line and repayment schedule",
   },
   Indexes: {
-    step2: 'Buy ${amt} of the {name} index on {chain} and hold it.',
-    venue: 'holdings',
-    weekly: 'a buy, a rebalance or a sale',
+    first: "Open the index on {chain} and buy a small test amount to confirm the constituents and the fees.",
+    weekly: "check the index's rebalance and your holding",
   },
-  'Collateral Markets': {
-    step2: 'Post ${amt} of collateral on {name} on {chain}.',
-    venue: 'positions',
-    weekly: 'a post, a borrow or a withdrawal',
-  },
-  'OTC Marketplace': {
-    step2: 'Place a ${amt} order on {name} on {chain} and settle it.',
-    venue: 'orders',
-    weekly: 'an order, a settlement or a vote',
-  },
-  'Cross Chain Bridge': {
-    step2: 'Bridge ${amt} through {name} on {chain} and keep the receipt.',
-    venue: 'bridges',
-    weekly: 'a bridge, a claim or a swap',
+  "Interest Rate Derivatives": {
+    first: "Open the rates market on {chain} and place a small test trade to confirm the rate and settlement.",
+    weekly: "check your rate position's mark and expiry",
   },
 };
 
-const DEFAULT_CAT: CatPlan = {
-  step2: 'Use {name} on {chain} with ${amt} and keep the position open.',
-  venue: 'positions',
-  weekly: 'a deposit, a borrow, a swap or a vote',
+const DEFAULT_PLAN: CatPlan = {
+  first: "Open the protocol on {chain} and use its main feature with a small test amount first.",
+  weekly: "use the protocol's main feature again with a small amount",
 };
 
-export function farmSteps(
-  p: SnapshotProtocol,
-  ageInternal: number,
-): string[] {
-  const name = p.name;
-  const cat = p.category ?? '';
-  const chains = p.chains.length > 0 ? p.chains : ['Ethereum'];
-  const chain = chains[0];
-  const tvl = p.tvl_usd;
-  const amt = tvl >= 1000000000 ? 150 : tvl >= 100000000 ? 100 : 50;
-  const gas = tvl >= 1000000000 ? 8 : tvl >= 100000000 ? 6 : 4;
-  const hold = ageInternal < 180 ? 30 : ageInternal < 540 ? 45 : 60;
-  const plan = CAT[cat] ?? DEFAULT_CAT;
-  // Replace only the {amt}/{amt2} placeholders: the "$" in front of them is
-  // literal template text ("Deposit ${amt}" -> "Deposit $150"). Replacing the
-  // whole "${amt}" token would swallow the dollar sign.
-  let step2 = plan.step2
-    .replaceAll('{amt}', String(amt))
-    .replaceAll('{amt2}', '25')
-    .replaceAll('{name}', name)
-    .replaceAll('{chain}', chain)
-    .replaceAll('{art}', article(name));
-  step2 += ` Cost: $${amt} of capital and about $${gas} of gas. Time: 15 minutes to set up.`;
-  const chainClause =
-    chains.length >= 2
-      ? `, rotating across two of its chains (${chains[0]} and ${chains[1]})`
-      : '';
+export function tierOf(tvl: number): { amt: number; gas: number } {
+  if (tvl >= 500_000_000) return { amt: 150, gas: 8 };
+  if (tvl >= 100_000_000) return { amt: 100, gas: 6 };
+  return { amt: 50, gas: 4 };
+}
+
+export function holdDaysOf(age: number | null): number {
+  const a = age === null ? AGE_DEFAULT_DAYS : age;
+  if (a >= 730) return 60;
+  if (a >= 365) return 45;
+  return 30;
+}
+
+// One-off setup minutes: steps 1, 2, 3, 6, 8 (20 + 25 + 25 + 15 + 30).
+export const SETUP_MIN = 115;
+
+export function farmTicket(p: Proto, asOf: string): Ticket {
+  const { amt, gas } = tierOf(p.tvl_usd);
+  return {
+    usd: 2 * amt + 4 * gas,
+    holdDays: holdDaysOf(ageDays(p.listed_at, asOf)),
+    setupMin: SETUP_MIN,
+  };
+}
+
+export function farmSteps(p: Proto, asOf: string): string[] {
+  const chain = p.chains[0] ?? "Ethereum";
+  const chain2 = p.chains.length > 1 ? p.chains[1] : null;
+  const { amt, gas } = tierOf(p.tvl_usd);
+  const plan = (p.category !== null && CAT_PLAN[p.category]) || DEFAULT_PLAN;
+  const age = ageDays(p.listed_at, asOf);
+  const hold = holdDaysOf(age);
+  const first = plan.first.replace("{chain}", chain);
+  const step3 =
+    chain2 !== null
+      ? `Repeat the same deposit on ${chain2}, so the position spans two chains and no single chain holds everything. Cost $${amt} + $${gas} gas \u00b7 Time 25 min.`
+      : `A week later, add a second tranche of $${amt} on ${chain} from the same wallet, so the position builds in two dated entries. Cost $${amt} + $${gas} gas \u00b7 Time 25 min.`;
   return [
-    'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Cost: under $3 of gas for the first transaction. Time: 5 minutes.',
-    step2,
-    `Move $25 between two of ${name}'s ${plan.venue}, so the wallet shows activity in more than one. Cost: about $25 of activity and $2 of gas. Time: 10 minutes.`,
-    `Make one qualifying action each week${chainClause}, such as ${plan.weekly}. Cost: about $2 of gas a week. Time: 10 minutes a week.`,
-    `Hold the position for at least ${hold} days so the activity is counted in more than one snapshot. Cost: the $${amt} stays in the position. Time: ${hold} days.`,
-    "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes. Cost: no fee to check, and never pay to claim. Time: 10 minutes.",
-    'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it. Cost: nothing but the log. Time: 5 minutes.',
+    `${first} Cost $0 \u00b7 Time 20 min.`,
+    `Deposit $${amt} into the position on ${chain} and confirm the receipt shows the expected balance. Cost $${amt} + $${gas} gas \u00b7 Time 25 min.`,
+    step3,
+    `Each week, ${plan.weekly} and keep a note of the date, amount and fee. Cost $${gas} gas \u00b7 Time 15 min/week.`,
+    `Keep a simple record \u2014 wallet, dates, amounts, transaction hashes \u2014 and check the protocol's points or eligibility page every week. Cost $0 \u00b7 Time 10 min/week.`,
+    `Verify the contract address against the protocol's official documentation and review your token approvals; revoke any unlimited spend you do not need. Cost $0 \u00b7 Time 15 min.`,
+    `Hold the position for ${hold} days without withdrawing, so the history reads as a real user and not a one-day visitor. Cost $0 \u00b7 Time ${hold} days.`,
+    `If a token is announced, claim only through the protocol's official page, then withdraw, revoke approvals and close the position. Cost $${gas} gas \u00b7 Time 30 min.`,
   ];
 }
 
-export interface BoardResult {
-  rows: BoardRow[];
-  marketMedian: number;
-  totalImplied: number;
-  liveTokenCount: number;
-  liveTokenTop: { name: string; category: string | null; tvl_usd: number; symbol: string | null }[];
-}
+// ---------------------------------------------------------------- board
 
-/** Build the ranked board from the snapshot. */
-export function buildBoard(snap: Snapshot): BoardResult {
-  const subjects = boardSubjects(snap);
-  const wl = new Set(snap.watchlist);
-
-  // Peer ratios: tokenized protocols (mcap recorded) in each category.
-  const byCategory = new Map<string, number[]>();
-  const allRatios: number[] = [];
-  for (const p of snap.protocols) {
-    const m = p.mcap_usd;
-    const t = p.tvl_usd;
-    if (m === null || m <= 0 || !t || t <= 0) continue;
-    const r = Math.min(m / t, PEER_RATIO_CAP);
-    const key = p.category ?? '';
-    const arr = byCategory.get(key) ?? [];
-    arr.push(r);
-    byCategory.set(key, arr);
-    allRatios.push(r);
-  }
-  const marketMedian = round4(median(allRatios));
-
-  const rows: BoardRow[] = [];
-  for (const p of subjects) {
-    const key = p.category ?? '';
-    const peerRatios = byCategory.get(key) ?? [];
-    const n = peerRatios.length;
-    const catMedian = n > 0 ? round4(median(peerRatios)) : marketMedian;
-    let multiple = n === 0 ? marketMedian : round4((catMedian * n + marketMedian * SHRINKAGE_K) / (n + SHRINKAGE_K));
-    if (multiple < MULTIPLE_FLOOR) multiple = MULTIPLE_FLOOR;
-    const chg = p.change_7d;
-    const growth = 1 + Math.max(-50, Math.min(100, chg === null ? 0 : chg)) / 100 * 0.5;
-    const { age, out } = ageDays(snap.as_of, p.listed_at);
-    const maturity = 0.6 + (Math.min(age, 1095) / 1095) * 0.4;
-    const chainF = 1 + 0.02 * Math.min(p.chains.length - 1, 5);
-    const implied = Math.round(p.tvl_usd * multiple * growth * maturity * chainF);
-    rows.push({
+export function buildBoard(snap: Snap): { rows: BoardRow[]; meta: BoardMeta } {
+  const fit = fitCurve(snap);
+  const effectByCat = new Map(fit.effects.map((e) => [e.name, e.adjDex]));
+  const watch = new Set(snap.watchlist);
+  const subjects = snap.protocols.filter(
+    (p) => watch.has(p.slug) || isEligible(p)
+  );
+  const rows: BoardRow[] = subjects.map((p) => {
+    const f = factors(p, snap.as_of);
+    const catKey = p.category === null ? "(none)" : p.category;
+    const adj = effectByCat.get(catKey) ?? 0;
+    const base = Math.pow(10, fit.a + fit.b * log10(p.tvl_usd) + adj);
+    const multiple = round4(base / p.tvl_usd);
+    const implied = Math.round(
+      p.tvl_usd * multiple * f.growth * f.maturity * f.chain
+    );
+    return {
       slug: p.slug,
       name: p.name,
       category: p.category,
       chains: p.chains,
       tvl_usd: p.tvl_usd,
-      change_7d: chg,
-      age_days: out,
+      change_7d: p.change_7d,
+      age_days: f.age,
       multiple,
       implied_value_usd: implied,
+      implied_lo_usd: Math.round(implied * fit.residP25),
+      implied_hi_usd: Math.round(implied * fit.residP75),
       rank: 0,
-      watchlist: wl.has(p.slug),
+      watchlist: watch.has(p.slug),
       model: {
-        category_median: catMedian,
-        peers: n,
-        market_median: marketMedian,
-        shrinkage_k: SHRINKAGE_K,
-        growth: round4(growth),
-        maturity: round4(maturity),
-        chain: round4(chainF),
+        catPeers:
+          fit.effects.find((e) => e.name === catKey)?.comps ?? 0,
+        catAdjDex: round4(adj),
+        growth: round4(f.growth),
+        maturity: round4(f.maturity),
+        chain: round4(f.chain),
       },
-      farm_steps: farmSteps(p, age),
-    });
-  }
-
-  rows.sort(
-    (a, b) =>
-      b.implied_value_usd - a.implied_value_usd ||
-      b.tvl_usd - a.tvl_usd ||
-      (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0),
-  );
+      farm_steps: farmSteps(p, snap.as_of),
+      ticket: farmTicket(p, snap.as_of),
+    };
+  });
+  rows.sort((x, y) => {
+    if (y.implied_value_usd !== x.implied_value_usd)
+      return y.implied_value_usd - x.implied_value_usd;
+    if (y.tvl_usd !== x.tvl_usd) return y.tvl_usd - x.tvl_usd;
+    return x.slug < y.slug ? -1 : 1;
+  });
   rows.forEach((r, i) => {
     r.rank = i + 1;
   });
-
-  const totalImplied = rows.reduce((s, r) => s + r.implied_value_usd, 0);
-  const live = snap.protocols.filter((p) => !isPreToken(p));
-  const liveTop = [...live]
-    .sort((a, b) => b.tvl_usd - a.tvl_usd)
-    .slice(0, 12)
-    .map((p) => ({ name: p.name, category: p.category, tvl_usd: p.tvl_usd, symbol: p.symbol }));
-
-  return { rows, marketMedian, totalImplied, liveTokenCount: live.length, liveTokenTop: liveTop };
+  const liveToken = snap.protocols.filter(
+    (p) => p.gecko_id !== null || p.symbol !== null
+  ).length;
+  const meta: BoardMeta = {
+    rows: rows.length,
+    totalImplied: rows.reduce((s, r) => s + r.implied_value_usd, 0),
+    asOf: snap.as_of,
+    comps: fit.comps,
+    excludedPlaceholder: fit.excludedPlaceholder,
+    curveA: round4(fit.a),
+    curveB: round4(fit.b),
+    level100m: round4(fit.level100m),
+    looX: round4(fit.looX),
+    flatX: round4(fit.flatX),
+    residP25: round4(fit.residP25),
+    residP75: round4(fit.residP75),
+    liveToken,
+    setAside: snap.protocols.length - liveToken - rows.length,
+    watchlistN: snap.watchlist.length,
+    categories: fit.effects,
+  };
+  return { rows, meta };
 }
