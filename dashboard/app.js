@@ -1,288 +1,318 @@
-// Token Radar dashboard — static, no network. Reads window.RADAR (data.js).
-(function () {
-  "use strict";
-  var R = window.RADAR || null;
-  var rowsEl = document.getElementById("rows");
-  var boardEl = document.getElementById("board");
+// app.js — Token Radar dashboard.
+// The board data is injected by main.ts (it replaces the data placeholder in
+// this file with the compact board). The page renders the board, the detail
+// view and the multiples table, and regenerates each protocol's farm plan
+// client-side with the same generator the board was built with, so the page
+// and board.json can never disagree about a plan.
+//
+// Compact row layout:
+// [rank, slug, name, category, chains, tvl, implied, change_7d, age_days,
+//  multiple, peers, category_median, growth, maturity, chain]
 
-  function esc(s) {
-    return String(s).replace(/[&<>"']/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-    });
-  }
-  function money(n) {
-    return "$" + Math.round(n).toLocaleString("en-US");
-  }
-  function compact(n) {
-    if (n >= 1e9) return "$" + (n / 1e9).toFixed(2) + "B";
-    if (n >= 1e6) return "$" + (n / 1e6).toFixed(1) + "M";
-    if (n >= 1e3) return "$" + (n / 1e3).toFixed(1) + "K";
-    return money(n);
-  }
-  function pct(v) {
-    if (v === null || v === undefined) return "—";
-    var sign = v > 0 ? "+" : "";
-    return sign + v.toFixed(1) + "%";
-  }
-  function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+const BOARD_DATA = __BOARD_DATA_JSON__;
 
-  var state = {
-    tab: "early",
-    sortKey: "rank",
-    sortDir: 1,
-    q: "",
-    category: "",
-    chain: "",
-    watchOnly: false,
-  };
+const META = {
+  asOf: BOARD_DATA.asOf,
+  floorUsd: BOARD_DATA.floorUsd,
+  marketMedian: BOARD_DATA.marketMedian,
+  totalImpliedUsd: BOARD_DATA.totalImpliedUsd,
+  watchlistCovered: BOARD_DATA.watchlistCovered,
+  watchlistTotal: BOARD_DATA.watchlistTotal,
+};
+const ROWS = BOARD_DATA.rows.map((r) => ({
+  rank: r[0], slug: r[1], name: r[2], category: r[3], chains: r[4],
+  tvl: r[5], implied: r[6], chg: r[7], age: r[8], mult: r[9], peers: r[10],
+  median: r[11], growth: r[12], maturity: r[13], chain: r[14],
+}));
 
-  function rowValue(row) {
-    if (state.tab === "live") {
-      return {
-        slug: row.slug, name: row.name, rank: row.rank, category: row.category,
-        chains: [], tvl_usd: row.tvl_usd, change_7d: null, age_days: null,
-        multiple: null, implied_value_usd: row.mcap_usd, mcap_usd: row.mcap_usd,
-      };
+// --- Farm plans: the same generator as lib/model.ts farmSteps() -----------
+function farmCapital(tvl) {
+  if (tvl >= 1000000000) return 150;
+  if (tvl >= 100000000) return 100;
+  return 50;
+}
+function farmHoldDays(age) {
+  if (age === null || age === undefined) return 30;
+  if (age < 180) return 60;
+  if (age < 365) return 45;
+  return 30;
+}
+function articleFor(name) {
+  return /^[aeiou]/i.test(name.trim()) ? "an" : "a";
+}
+const STEP2 = {
+  "Risk Curators": "vault", "Onchain Capital Allocator": "vault",
+  "Yield": "yield-vault", "Yield Aggregator": "yield-vault",
+  "Farm": "farm", "Liquidity Manager": "managed",
+  "Anchor BTC": "deposit", "CeDeFi": "deposit",
+  "Crypto Card Issuer": "deposit", "Decentralized BTC": "deposit",
+  "Governance Incentives": "deposit",
+  "Lending": "supply", "Collateral Markets": "supply",
+  "Uncollateralized Lending": "supply",
+  "Dexs": "liquidity", "Indexes": "liquidity", "Leveraged Farming": "liquidity",
+  "Basis Trading": "margin", "Derivatives": "margin",
+  "Interest Rate Derivatives": "margin",
+  "CDP": "mint-stable",
+  "Dual-Token Stablecoin": "mint-stable-asset",
+  "Stablecoin Wrapper": "mint-stable-asset",
+  "Chain": "bridge-chain", "Insurance": "cover", "Payments": "payment",
+  "Prediction Market": "predict", "RWA": "mint-yield-asset",
+  "Restaking": "stake", "Staking Pool": "stake",
+};
+const STEP3 = {
+  "Risk Curators": "vault-move", "Onchain Capital Allocator": "vault-move",
+  "Yield": "harvest", "Yield Aggregator": "harvest",
+  "Farm": "rebalance", "Liquidity Manager": "rebalance",
+  "Anchor BTC": "generic", "CeDeFi": "generic", "Chain": "generic",
+  "Crypto Card Issuer": "generic", "Decentralized BTC": "generic",
+  "Governance Incentives": "generic",
+  "CDP": "borrow", "Lending": "borrow", "Collateral Markets": "borrow",
+  "Uncollateralized Lending": "borrow",
+  "Dexs": "swap-pool", "Indexes": "swap-pool", "Leveraged Farming": "swap-pool",
+  "Basis Trading": "hedge", "Derivatives": "hedge",
+  "Interest Rate Derivatives": "hedge",
+  "Dual-Token Stablecoin": "swap-stable", "Stablecoin Wrapper": "swap-stable",
+  "Insurance": "cover2", "Payments": "payment2",
+  "Prediction Market": "predict2", "RWA": "rwa-redeem",
+  "Restaking": "stake2", "Staking Pool": "stake2",
+};
+function step2Text(kind, name, chain0, cap, gas) {
+  const cost = " Cost: $" + cap + " of capital and about $" + gas +
+    " of gas. Time: 15 minutes to set up.";
+  switch (kind) {
+    case "vault": return "Deposit $" + cap + " into " + articleFor(name) + " " + name + " vault on " + chain0 + " and keep the shares." + cost;
+    case "yield-vault": return "Deposit $" + cap + " into " + name + "'s highest-yield vault on " + chain0 + " and keep the shares." + cost;
+    case "farm": return "Deposit $" + cap + " into " + name + "'s main farm on " + chain0 + " and keep the position staked." + cost;
+    case "managed": return "Deposit $" + cap + " into " + articleFor(name) + " " + name + " managed position on " + chain0 + " and keep it open." + cost;
+    case "deposit": return "Deposit $" + cap + " of USDC into " + name + " on " + chain0 + " and keep the position open." + cost;
+    case "supply": return "Supply $" + cap + " of USDC to " + name + " on " + chain0 + " and keep the position open." + cost;
+    case "liquidity": return "Provide $" + cap + " of liquidity to " + name + "'s main pool on " + chain0 + " and keep the position open." + cost;
+    case "margin": return "Deposit $" + cap + " of USDC as margin on " + name + " and open one small hedged position." + cost;
+    case "mint-stable": return "Mint $" + cap + " of the stablecoin by locking collateral in " + name + " on " + chain0 + "." + cost;
+    case "mint-stable-asset": return "Mint or deposit $" + cap + " of the stable asset through " + name + " on " + chain0 + "." + cost;
+    case "bridge-chain": return "Bridge $" + cap + " onto the chain " + name + " secures and use one of its apps." + cost;
+    case "cover": return "Buy $" + cap + " of cover from " + name + " on " + chain0 + " and keep the policy active." + cost;
+    case "payment": return "Send one $" + cap + " payment through " + name + " on " + chain0 + " and keep the receipt." + cost;
+    case "predict": return "Fund $" + cap + " and place one market position on " + name + "." + cost;
+    case "mint-yield-asset": return "Mint $" + cap + " of the protocol's yield-bearing asset on " + chain0 + " and hold it." + cost;
+    case "stake": return "Stake $" + cap + " of the chain's staking asset through " + name + " and keep the receipt token." + cost;
+    default: return "Deposit $" + cap + " of USDC into " + name + " on " + chain0 + " and keep the position open." + cost;
+  }
+}
+function step3Text(kind, name) {
+  const cost = " Cost: about $25 of activity and $2 of gas. Time: 10 minutes.";
+  switch (kind) {
+    case "vault-move": return "Move $25 between two of " + name + "'s vaults, so the wallet shows activity in more than one." + cost;
+    case "harvest": return "Claim or compound the yield once, so the wallet shows a harvest from " + name + "." + cost;
+    case "rebalance": return "Rebalance the position once, so the wallet shows a second transaction on " + name + "." + cost;
+    case "generic": return "Make one more qualifying action of a different kind than the first on " + name + "." + cost;
+    case "borrow": return "Borrow $25 against the supply and repay it a week later, so the wallet shows both sides of " + name + "." + cost;
+    case "swap-pool": return "Swap $25 through the same pool once, so the wallet shows a trade as well as liquidity on " + name + "." + cost;
+    case "hedge": return "Close the hedge and open a fresh one, so the wallet shows two round trips on " + name + "." + cost;
+    case "swap-stable": return "Swap $25 of the stable asset through " + name + "'s own route." + cost;
+    case "cover2": return "Open a second small cover on another pool of " + name + "." + cost;
+    case "payment2": return "Make a second $25 payment to a different address through " + name + "." + cost;
+    case "predict2": return "Settle one market and open another, so the wallet shows two positions on " + name + "." + cost;
+    case "rwa-redeem": return "Redeem a small part of the yield asset and re-mint it through " + name + "." + cost;
+    case "stake2": return "Delegate a second small stake through " + name + " and keep both receipts." + cost;
+    default: return "Make one more qualifying action of a different kind than the first on " + name + "." + cost;
+  }
+}
+function farmSteps(row) {
+  const cap = farmCapital(row.tvl);
+  const gas = cap === 150 ? 8 : 4;
+  const hold = farmHoldDays(row.age);
+  const chain0 = row.chains[0] || "its chain";
+  const kind2 = STEP2[row.category] || "deposit";
+  const kind3 = STEP3[row.category] || "generic";
+  const step4 = row.chains.length >= 2
+    ? "Make one qualifying action each week, rotating across two of its chains (" + row.chains[0] + " and " + row.chains[1] + "), such as a deposit, a borrow, a swap or a vote. Cost: about $2 of gas a week. Time: 10 minutes a week."
+    : "Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote. Cost: about $2 of gas a week. Time: 10 minutes a week.";
+  return [
+    "Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Cost: under $3 of gas for the first transaction. Time: 5 minutes.",
+    step2Text(kind2, row.name, chain0, cap, gas),
+    step3Text(kind3, row.name),
+    step4,
+    "Hold the position for at least " + hold + " days so the activity is counted in more than one snapshot. Cost: the $" + cap + " stays in the position. Time: " + hold + " days.",
+    "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes. Cost: no fee to check, and never pay to claim. Time: 10 minutes.",
+    "Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it. Cost: nothing but the log. Time: 5 minutes.",
+  ];
+}
+
+// --- Formatting ------------------------------------------------------------
+function fmtMoney(n) {
+  if (n >= 1000000000) return "$" + (n / 1000000000).toFixed(2) + "B";
+  if (n >= 1000000) return "$" + (n / 1000000).toFixed(n >= 100000000 ? 0 : 1) + "M";
+  if (n >= 1000) return "$" + (n / 1000).toFixed(0) + "K";
+  return "$" + n;
+}
+function fmtPct(c) {
+  if (c === null || c === undefined) return "—";
+  return (c >= 0 ? "+" : "") + c.toFixed(1) + "%";
+}
+function fmtAge(a) {
+  if (a === null || a === undefined) return "unknown";
+  return a + "d";
+}
+function esc(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// --- State -----------------------------------------------------------------
+let sortKey = "rank";
+let sortDir = 1;
+const $ = (id) => document.getElementById(id);
+
+function filteredRows() {
+  const q = $("q").value.trim().toLowerCase();
+  const cat = $("cat").value;
+  let rows = ROWS.filter((r) => {
+    if (cat && r.category !== cat) return false;
+    if (q && !(r.name.toLowerCase().includes(q) ||
+      r.slug.includes(q) || r.category.toLowerCase().includes(q))) return false;
+    return true;
+  });
+  const key = sortKey;
+  const dir = sortDir;
+  rows = rows.slice().sort((a, b) => {
+    let d = 0;
+    if (key === "rank") d = a.rank - b.rank;
+    else if (key === "implied") d = b.implied - a.implied;
+    else if (key === "tvl") d = b.tvl - a.tvl;
+    else if (key === "age") d = (b.age === null ? -1 : b.age) - (a.age === null ? -1 : a.age);
+    else if (key === "name") d = a.name.localeCompare(b.name);
+    else if (key === "category") d = a.category.localeCompare(b.category);
+    else if (key === "mult") d = b.mult - a.mult;
+    return d * (key === "rank" ? 1 : dir);
+  });
+  return rows;
+}
+
+function renderBoard() {
+  const rows = filteredRows();
+  const tb = $("rows");
+  tb.innerHTML = rows.map((r) => (
+    "<tr data-slug=\"" + esc(r.slug) + "\">" +
+    "<td class=\"rank num\">" + r.rank + "</td>" +
+    "<td class=\"name\">" + esc(r.name) + "<small>" + esc(r.slug) + "</small></td>" +
+    "<td>" + esc(r.category) + "</td>" +
+    "<td>" + esc(r.chains.slice(0, 3).join(", ")) + (r.chains.length > 3 ? " +" + (r.chains.length - 3) : "") + "</td>" +
+    "<td class=\"num\">" + fmtMoney(r.tvl) + "</td>" +
+    "<td class=\"num\">" + fmtPct(r.chg) + "</td>" +
+    "<td class=\"num\">" + fmtAge(r.age) + "</td>" +
+    "<td class=\"num imp\">" + fmtMoney(r.implied) + "</td>" +
+    "<td class=\"num mult\">" + r.mult.toFixed(4) + "×</td>" +
+    "</tr>"
+  )).join("");
+  $("count").textContent = rows.length + " of " + ROWS.length +
+    " protocols · click a row for its detail and farm plan.";
+  tb.querySelectorAll("tr").forEach((tr) => {
+    tr.addEventListener("click", () => { location.hash = "#p=" + tr.dataset.slug; });
+  });
+}
+
+function renderDetail(slug) {
+  const r = ROWS.find((x) => x.slug === slug);
+  const el = $("detail");
+  if (!r) { el.hidden = true; $("boardWrap").hidden = false; return; }
+  const steps = farmSteps(r);
+  el.innerHTML =
+    "<button class=\"back\" id=\"backBtn\" type=\"button\">← Back to the board</button>" +
+    "<h2>" + esc(r.name) + " <small>#" + r.rank + "</small></h2>" +
+    "<p class=\"meta\">" + esc(r.category) + " · " + esc(r.chains.join(", ")) +
+    " · TVL " + fmtMoney(r.tvl) + " · 7d " + fmtPct(r.chg) +
+    " · age " + fmtAge(r.age) + "</p>" +
+    "<h3>Implied value: " + fmtMoney(r.implied) + "</h3>" +
+    "<div class=\"kv\">" +
+    "<div><span>Category multiple</span><b>" + r.mult.toFixed(4) + "×</b></div>" +
+    "<div><span>Category peer median</span><b>" + (r.median === null ? "—" : r.median.toFixed(4) + "×") + "</b></div>" +
+    "<div><span>Tokenized peers</span><b>" + r.peers + "</b></div>" +
+    "<div><span>Market median</span><b>" + META.marketMedian.toFixed(4) + "×</b></div>" +
+    "<div><span>Growth</span><b>×" + r.growth.toFixed(3) + "</b></div>" +
+    "<div><span>Maturity</span><b>×" + r.maturity.toFixed(4) + "</b></div>" +
+    "<div><span>Chains</span><b>×" + r.chain.toFixed(2) + "</b></div>" +
+    "</div>" +
+    "<h3>How to farm it</h3><ol>" +
+    steps.map((s) => "<li>" + esc(s) + "</li>").join("") +
+    "</ol>";
+  el.hidden = false;
+  $("boardWrap").hidden = true;
+  $("backBtn").addEventListener("click", () => { location.hash = ""; });
+}
+
+function renderMultTable() {
+  const byCat = {};
+  for (const r of ROWS) {
+    if (!byCat[r.category]) {
+      byCat[r.category] = { peers: r.peers, median: r.median, mult: r.mult };
     }
-    return row;
   }
+  const cats = Object.keys(byCat).sort((a, b) => byCat[b].mult - byCat[a].mult);
+  document.querySelector("#multTable tbody").innerHTML = cats.map((c) => (
+    "<tr><td>" + esc(c) + "</td><td class=\"num\">" + byCat[c].peers + "</td>" +
+    "<td class=\"num\">" + (byCat[c].median === null ? "—" : byCat[c].median.toFixed(4) + "×") + "</td>" +
+    "<td class=\"num\">" + byCat[c].mult.toFixed(4) + "×</td></tr>"
+  )).join("");
+}
 
-  function currentRows() {
-    var list = state.tab === "live"
-      ? R.live.map(function (r, i) { return Object.assign({}, r, { rank: i + 1 }); })
-      : R.rows;
-    return list.filter(function (r) {
-      if (state.q) {
-        var hay = (r.name + " " + r.slug).toLowerCase();
-        if (hay.indexOf(state.q.toLowerCase()) === -1) return false;
-      }
-      if (state.category && r.category !== state.category) return false;
-      if (state.chain && (!r.chains || r.chains.indexOf(state.chain) === -1)) return false;
-      if (state.watchOnly && !r.watchlist) return false;
-      return true;
-    });
+function renderStats() {
+  $("stats").innerHTML =
+    "<b>" + ROWS.length + "</b> protocols · watchlist <b>" +
+    META.watchlistCovered + "/" + META.watchlistTotal + "</b> · " +
+    "total implied <b>" + fmtMoney(META.totalImpliedUsd) + "</b><br>" +
+    "snapshot " + esc(META.asOf) + " · market median <b>" +
+    META.marketMedian.toFixed(4) + "×</b> · shrinkage prior k = 6";
+  $("asof").textContent = META.asOf;
+  $("mmed").textContent = META.marketMedian.toFixed(4) + "×";
+}
+
+function route() {
+  const h = location.hash || "";
+  const m = h.match(/^#p=([\w-]+)/);
+  if (m) { renderDetail(m[1]); return; }
+  $("detail").hidden = true;
+  $("boardWrap").hidden = false;
+  const c = h.match(/^#category=(.+)/);
+  if (c) {
+    const cat = decodeURIComponent(c[1]);
+    if ([...$("cat").options].some((o) => o.value === cat)) $("cat").value = cat;
   }
+  renderBoard();
+}
 
-  function sortRows(list) {
-    var key = state.sortKey, dir = state.sortDir;
-    return list.slice().sort(function (a, b) {
-      var av = a[key], bv = b[key];
-      if (av === null || av === undefined) return 1;
-      if (bv === null || bv === undefined) return -1;
-      if (typeof av === "string") return dir * av.localeCompare(bv);
-      return dir * (av - bv);
-    });
+function init() {
+  const cats = [...new Set(ROWS.map((r) => r.category))].sort();
+  for (const c of cats) {
+    const o = document.createElement("option");
+    o.value = c; o.textContent = c;
+    $("cat").appendChild(o);
   }
-
-  function render() {
-    if (!R) {
-      rowsEl.innerHTML = '<tr><td colspan="7">No radar data loaded.</td></tr>';
-      return;
-    }
-    var list = sortRows(currentRows());
-    var html = list.map(function (r) {
-      var v = rowValue(r);
-      var change = v.change_7d === null || v.change_7d === undefined
-        ? '<span>—</span>'
-        : '<span class="' + (v.change_7d >= 0 ? "up" : "down") + '">' + pct(v.change_7d) + "</span>";
-      var age = v.age_days === null || v.age_days === undefined ? "—" : v.age_days + " d";
-      var mult = v.multiple === null || v.multiple === undefined ? "—" : v.multiple.toFixed(4) + "×";
-      var watch = r.watchlist ? '<span class="badge">WATCH</span>' : "";
-      return "<tr data-slug=\"" + esc(r.slug) + "\">" +
-        '<td class="rank">' + v.rank + "</td>" +
-        "<td><strong>" + esc(r.name) + "</strong>" + watch + "<br><span style=\"color:var(--muted);font-size:12px\">" + esc(r.slug) + "</span></td>" +
-        '<td class="num">' + compact(v.tvl_usd) + "</td>" +
-        '<td class="num">' + change + "</td>" +
-        '<td class="num">' + age + "</td>" +
-        '<td class="num">' + mult + "</td>" +
-        '<td class="num"><strong>' + money(v.implied_value_usd) + "</strong></td></tr>";
-    }).join("");
-    rowsEl.innerHTML = html;
-    document.getElementById("empty").hidden = list.length > 0;
-    document.getElementById("rowCount").textContent = list.length + " rows shown";
-    boardEl.querySelectorAll("thead th").forEach(function (th) {
-      th.classList.toggle("sorted", th.getAttribute("data-key") === state.sortKey);
+  $("q").addEventListener("input", renderBoard);
+  $("cat").addEventListener("change", renderBoard);
+  $("sort").addEventListener("change", () => {
+    const v = $("sort").value;
+    if (v === "rank") { sortKey = "rank"; sortDir = 1; }
+    else { sortKey = v; sortDir = 1; }
+    renderBoard();
+  });
+  document.querySelectorAll("#board th[data-k]").forEach((th) => {
+    th.addEventListener("click", () => {
+      const k = th.dataset.k;
+      if (sortKey === k) sortDir = -sortDir;
+      else { sortKey = k; sortDir = k === "rank" ? 1 : 1; }
+      renderBoard();
     });
-    var lastTh = boardEl.querySelector('thead th[data-key="implied_value_usd"]');
-    lastTh.textContent = state.tab === "live" ? "Market cap" : "Implied value";
-  }
+  });
+  $("modelToggle").addEventListener("click", () => {
+    const m = $("model");
+    m.hidden = !m.hidden;
+    if (!m.hidden) renderMultTable();
+  });
+  window.addEventListener("hashchange", route);
+  renderStats();
+  renderMultTable();
+  route();
+}
 
-  function renderMultiples() {
-    if (!R) return;
-    document.getElementById("multipleRows").innerHTML = R.multiples.map(function (m) {
-      return "<tr><td>" + esc(m.category) + "</td>" +
-        '<td class="num">' + m.peers + "</td>" +
-        '<td class="num">' + (m.median === null ? "—" : m.median.toFixed(4) + "×") + "</td>" +
-        '<td class="num"><strong>' + m.multiple.toFixed(4) + "×</strong></td></tr>";
-    }).join("");
-  }
-
-  function openDetail(slug) {
-    var row = null;
-    for (var i = 0; i < R.rows.length; i++) {
-      if (R.rows[i].slug === slug) { row = R.rows[i]; break; }
-    }
-    var detail = document.getElementById("detail");
-    if (!row) {
-      var live = null;
-      for (var j = 0; j < R.live.length; j++) {
-        if (R.live[j].slug === slug) { live = R.live[j]; break; }
-      }
-      if (!live) return;
-      detail.innerHTML = "<h2>" + esc(live.name) + "</h2><p class=\"sub\">" + esc(live.category) +
-        " · token already trades · market cap " + money(live.mcap_usd) + "</p>" +
-        "<p>This protocol is set aside in the live view because its token already trades. " +
-        "The board ranks protocols that record no token yet.</p>";
-      document.getElementById("drawer").hidden = false;
-      return;
-    }
-    var mult = R.multiples.filter(function (m) { return m.category === row.category; })[0];
-    var growth = 1 + (clamp(row.change_7d === null ? 0 : row.change_7d, -50, 100) / 100) * 0.5;
-    var ageF = 0.6 + (Math.min(row.age_days, 1095) / 1095) * 0.4;
-    var chainF = 1 + 0.02 * Math.min(Math.max(row.chains.length - 1, 0), 5);
-    var recomputed = Math.max(1, Math.round(row.tvl_usd * row.multiple * growth * ageF * chainF));
-    var close = Math.abs(recomputed - row.implied_value_usd) <= Math.max(1, row.implied_value_usd * 0.001);
-    var steps = row.farm_steps.map(function (s) { return "<li>" + esc(s) + "</li>"; }).join("");
-    detail.innerHTML =
-      "<h2>" + esc(row.name) + "</h2>" +
-      '<p class="sub">Rank ' + row.rank + " · " + esc(row.category) + " · " +
-      esc(row.chains.join(", ")) + (row.watchlist ? ' · <span class="badge">WATCHLIST</span>' : "") + "</p>" +
-      '<dl class="kv">' +
-      "<div><dt>Implied value</dt><dd>" + money(row.implied_value_usd) + "</dd></div>" +
-      "<div><dt>TVL</dt><dd>" + money(row.tvl_usd) + "</dd></div>" +
-      "<div><dt>7-day change</dt><dd>" + pct(row.change_7d) + "</dd></div>" +
-      "<div><dt>Age</dt><dd>" + row.age_days + " days" + (row.listed_at ? " · since " + esc(row.listed_at) : " · listing date unknown") + "</dd></div>" +
-      "<div><dt>Multiple</dt><dd>" + row.multiple.toFixed(4) + "× (" + esc(row.category) + ")</dd></div>" +
-      "<div><dt>Chains</dt><dd>" + row.chains.length + "</dd></div>" +
-      "</dl>" +
-      "<h3>How the number is built</h3>" +
-      '<ul class="factors">' +
-      "<li>TVL " + money(row.tvl_usd) + "</li>" +
-      "<li>Multiple " + row.multiple.toFixed(4) + "× — " + esc(row.category) + ", " +
-        (mult ? mult.peers + " tokenized peer" + (mult.peers === 1 ? "" : "s") + ", median ratio " +
-        (mult.median === null ? "none" : mult.median.toFixed(4) + "×") : "no peer data") + "</li>" +
-      "<li>Growth factor " + growth.toFixed(4) + " — 7-day change " + pct(row.change_7d) + ", halved and clamped</li>" +
-      "<li>Age factor " + ageF.toFixed(4) + " — " + row.age_days + " days, 0.6× at launch rising to 1.0× at three years</li>" +
-      "<li>Chain factor " + chainF.toFixed(4) + " — " + row.chains.length + " chain" + (row.chains.length === 1 ? "" : "s") + ", 2% per extra chain up to five</li>" +
-      "</ul>" +
-      '<p class="recompute">Recomputed from the factors above: ' + money(recomputed) +
-        (close ? " — the same number board.json carries (within rounding)." : " — differs from board.json; see the model panel.") + "</p>" +
-      "<h3>How to farm it — 7 steps</h3><ol>" + steps + "</ol>";
-    document.getElementById("drawer").hidden = false;
-  }
-
-  function closeDetail() {
-    document.getElementById("drawer").hidden = true;
-    if (location.hash.indexOf("#p=") === 0) history.replaceState(null, "", location.pathname + location.search);
-  }
-
-  function applyHash() {
-    var h = location.hash.replace(/^#/, "");
-    if (!h) return;
-    var params = {};
-    h.split("&").forEach(function (part) {
-      var kv = part.split("=");
-      if (kv.length === 2) params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]);
-    });
-    if (params.tab === "live") setTab("live");
-    if (params.category) {
-      state.category = params.category;
-      document.getElementById("category").value = params.category;
-    }
-    if (params.chain) {
-      state.chain = params.chain;
-      document.getElementById("chain").value = params.chain;
-    }
-    if (params.watch === "1") {
-      state.watchOnly = true;
-      document.getElementById("watchOnly").checked = true;
-    }
-    render();
-    if (params.p) openDetail(params.p);
-  }
-
-  function syncHash() {
-    var parts = [];
-    if (state.tab === "live") parts.push("tab=live");
-    if (state.category) parts.push("category=" + encodeURIComponent(state.category));
-    if (state.chain) parts.push("chain=" + encodeURIComponent(state.chain));
-    if (state.watchOnly) parts.push("watch=1");
-    var hash = parts.length ? "#" + parts.join("&") : "";
-    history.replaceState(null, "", location.pathname + location.search + hash);
-  }
-
-  function setTab(tab) {
-    state.tab = tab;
-    document.getElementById("tabEarly").setAttribute("aria-selected", tab === "early" ? "true" : "false");
-    document.getElementById("tabLive").setAttribute("aria-selected", tab === "live" ? "true" : "false");
-    if (tab === "live") { state.sortKey = "rank"; state.sortDir = 1; }
-    render();
-  }
-
-  function init() {
-    if (!R) {
-      document.getElementById("statRows").textContent = "—";
-      render();
-      return;
-    }
-    document.getElementById("statRows").textContent = R.rows.length;
-    document.getElementById("statTotal").textContent = compact(R.total_implied_value_usd);
-    document.getElementById("statMedian").textContent = R.market_median.toFixed(4) + "×";
-    document.getElementById("asOf").textContent = R.as_of;
-
-    var catSel = document.getElementById("category");
-    var cats = [];
-    R.rows.forEach(function (r) { if (cats.indexOf(r.category) === -1) cats.push(r.category); });
-    cats.sort().forEach(function (c) {
-      var o = document.createElement("option");
-      o.value = c; o.textContent = c; catSel.appendChild(o);
-    });
-    var chainSel = document.getElementById("chain");
-    var chains = [];
-    R.rows.forEach(function (r) {
-      r.chains.forEach(function (ch) { if (chains.indexOf(ch) === -1) chains.push(ch); });
-    });
-    chains.sort().forEach(function (c) {
-      var o = document.createElement("option");
-      o.value = c; o.textContent = c; chainSel.appendChild(o);
-    });
-
-    document.getElementById("q").addEventListener("input", function (e) {
-      state.q = e.target.value; render();
-    });
-    catSel.addEventListener("change", function (e) {
-      state.category = e.target.value; render(); syncHash();
-    });
-    chainSel.addEventListener("change", function (e) {
-      state.chain = e.target.value; render(); syncHash();
-    });
-    document.getElementById("watchOnly").addEventListener("change", function (e) {
-      state.watchOnly = e.target.checked; render(); syncHash();
-    });
-    document.getElementById("tabEarly").addEventListener("click", function () { setTab("early"); syncHash(); });
-    document.getElementById("tabLive").addEventListener("click", function () { setTab("live"); syncHash(); });
-    boardEl.querySelectorAll("thead th").forEach(function (th) {
-      th.addEventListener("click", function () {
-        var key = th.getAttribute("data-key");
-        if (state.sortKey === key) state.sortDir = -state.sortDir;
-        else { state.sortKey = key; state.sortDir = key === "name" ? 1 : -1; }
-        render();
-      });
-    });
-    rowsEl.addEventListener("click", function (e) {
-      var tr = e.target.closest("tr[data-slug]");
-      if (!tr) return;
-      openDetail(tr.getAttribute("data-slug"));
-      history.replaceState(null, "", location.pathname + location.search + "#p=" + tr.getAttribute("data-slug"));
-    });
-    document.getElementById("drawerClose").addEventListener("click", closeDetail);
-    window.addEventListener("hashchange", applyHash);
-
-    renderMultiples();
-    render();
-    applyHash();
-  }
-
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
-  else init();
-})();
+init();
