@@ -8,92 +8,124 @@
 </head>
 <body>
 <header class="top">
-  <div class="title-block">
-    <h1>Token Radar</h1>
-    <p class="sub">Pre-token protocols, ranked by what a token would be worth if the
-    protocol's record stayed as it is — and how to farm each one before it issues one.</p>
-  </div>
-  <div class="stats" id="stats">Loading the board…</div>
+  <div class="brand"><span class="mark">◆</span> TOKEN RADAR</div>
+  <div class="meta">Snapshot 2026-11-14 &middot; DefiLlama protocol index &middot; category-median model</div>
 </header>
 
-<nav class="controls">
-  <input id="q" type="search" placeholder="Search a protocol…" aria-label="Search protocols">
-  <select id="cat" aria-label="Filter by category"><option value="">All categories</option></select>
-  <select id="sort" aria-label="Sort the board">
-    <option value="rank">Sort: rank</option>
-    <option value="implied">Sort: implied value</option>
-    <option value="tvl">Sort: TVL</option>
-    <option value="age">Sort: age</option>
-  </select>
-  <button id="modelToggle" type="button">How the value is built</button>
-</nav>
-
-<section id="model" class="model" hidden>
-  <h2>How the value is built</h2>
-  <p>Every implied value follows from the snapshot's own figures — TVL, the
-  seven-day change, how long the protocol has run with no token, and how many
-  chains it runs on. Nothing on the board comes from a hardcoded list of
-  names: the list below is a filter for which protocols are pre-token
-  subjects, never an input to a value.</p>
-  <h3>The multiple</h3>
-  <p>Each category's multiple is the median FDV/TVL ratio of its tokenized
-  peers (protocols in the same category with a recorded market cap; each peer
-  ratio capped at 2.0×), shrunk toward the market median with a prior of
-  <strong>6</strong> — the market median counts as six pseudo-observations, so
-  one peer can no longer produce a confident multiple. A category with no
-  peers takes the market median itself. The multiple is capped at 1.0× and
-  floored at 0.02×.</p>
-  <p><code>implied = TVL × multiple × growth × maturity × chain</code><br>
-  <code>growth = 1 + clamp(change_7d, −50%, +100%) × 0.5</code> (unreported change counts as 0)<br>
-  <code>maturity = 0.6 + min(age_days, 1095) / 1095 × 0.4</code> (unknown age counts as 365 days)<br>
-  <code>chain = 1 + 0.02 × min(chains − 1, 5)</code></p>
-  <h3>Multiples by category</h3>
-  <table id="multTable" class="mult">
-    <thead><tr><th>Category</th><th>Peers</th><th>Peer median</th><th>Multiple</th></tr></thead>
-    <tbody></tbody>
-  </table>
-  <h3>What is on the board</h3>
-  <p>The snapshot's watchlist (40 protocols, read as given) plus the pre-token
-  protocols below the $50M floor that pass every filter: they record no token
-  (no market cap, no Gecko id, no symbol), are not a CEX, carry no version
-  marker and no word wrapped/staked/staking, do not begin with an exchange's
-  name, are not a product of a tokenized parent (brand guard), and are not in
-  a category that is itself a product of a token that trades (Bridge,
-  Canonical Bridge, Liquid Staking, Liquid Restaking, Restaked BTC, CEX).</p>
-  <h3>What the data cannot say</h3>
-  <p>Only 128 of the snapshot's tokenized protocols carry a recorded market
-  cap, so only those 128 can be peers; 288 more record a token but no market
-  cap, so no ratio can be formed for them. The snapshot carries no
-  parentProtocol field, so a below-floor protocol that is quietly a product of
-  a tokenized project can still slip past the brand guard when its category
-  gives it away — the brand guard and the category exclusion catch the ones
-  the snapshot's own signals can name, and the rest is a stated residual gap,
-  not a claim. A protocol is always described as recording no token, never as
-  having none.</p>
-  <p class="fine">Implied values are this entry's own claim, never one make.fun
-  makes. They do not predict whether or when a token is issued.</p>
-</section>
-
 <main>
-  <section id="detail" class="detail" hidden></section>
-  <section id="boardWrap">
-    <table id="board" class="board">
-      <thead><tr>
-        <th data-k="rank">#</th><th data-k="name">Protocol</th><th data-k="category">Category</th>
-        <th data-k="chains">Chains</th><th data-k="tvl">TVL</th><th data-k="chg">7d</th>
-        <th data-k="age">Age</th><th data-k="implied">Implied value</th><th data-k="mult">Multiple</th>
-      </tr></thead>
-      <tbody id="rows"></tbody>
-    </table>
-    <p id="count" class="count"></p>
-  </section>
-</main>
+  <h1>40 watchlist protocols, ranked by implied value</h1>
+  <p class="lede">The watchlist is the floor: every protocol with at least $50M of TVL that
+  records no token. The early radar adds 158 pre-token protocols below that floor,
+  scored by the same model. Implied value is a model, not a promise: a protocol
+  records no token, it never has none.</p>
 
-<footer>
-  <p>Token Radar · snapshot as of <span id="asof">—</span> · market median
-  <span id="mmed">—</span> · shrinkage prior k = 6 · the board ranks pre-token
-  protocols by implied value; the watchlist is the floor, never the ceiling.</p>
-</footer>
+  <section class="stats" id="stats">
+    <div class="stat"><b id="stat-watchlist">40 / 40</b><span>Watchlist covered</span></div>
+    <div class="stat"><b id="stat-rows">198</b><span>Pre-token rows scored</span></div>
+    <div class="stat"><b id="stat-early">158</b><span>Early rows below the floor</span></div>
+    <div class="stat"><b id="stat-live">416</b><span>Live-token protocols set aside</span></div>
+    <div class="stat"><b id="stat-total">$7.37B</b><span>Total implied value</span></div>
+    <div class="stat"><b id="stat-median">0.2138&times;</b><span>Median benchmark multiple</span></div>
+  </section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="board">Board</button>
+    <button class="tab" data-tab="model">The model</button>
+    <button class="tab" data-tab="trading">Already trading</button>
+  </nav>
+
+  <section id="tab-board" class="tabpanel">
+    <div class="filters">
+      <label>Search<input id="q" type="search" placeholder="Search name, category or chain"></label>
+      <label>Category<select id="f-cat"><option value="">All categories</option></select></label>
+      <label>Chain<select id="f-chain"><option value="">All chains</option></select></label>
+      <label>Minimum TVL<select id="f-tvl">
+        <option value="0">Any TVL</option>
+        <option value="1000000000">$1B+</option>
+        <option value="500000000">$500M+</option>
+        <option value="100000000">$100M+</option>
+        <option value="50000000">$50M+</option>
+      </select></label>
+      <div class="pills">
+        <button id="pill-pre" class="pill active">Pre-token</button>
+        <button id="pill-live" class="pill">Live token</button>
+      </div>
+      <button id="clear-filters" class="clear">Clear filters</button>
+    </div>
+    <p class="shown"><span id="row-count">198 rows shown</span> &middot; Pre-token protocols, strongest implied value first. Select a row for its model and farm plan.</p>
+    <table id="board">
+      <thead><tr>
+        <th data-sort="rank">Rank</th>
+        <th data-sort="name">Protocol</th>
+        <th data-sort="tvl">TVL</th>
+        <th data-sort="chg">7d</th>
+        <th data-sort="age">No token for</th>
+        <th data-sort="mult">Multiple</th>
+        <th data-sort="impl">Implied value</th>
+        <th>Token</th>
+      </tr></thead>
+      <tbody id="board-body"></tbody>
+    </table>
+    <div id="live-list" class="live-list" hidden>
+      <p class="lede">These protocols already trade a token, so the radar sets them aside
+      instead of ranking them. They are shown here, not scored.</p>
+      <table><thead><tr><th>Protocol</th><th>Category</th><th>TVL</th><th>Token</th></tr></thead>
+      <tbody id="live-body"></tbody></table>
+    </div>
+  </section>
+
+  <section id="tab-detail" class="tabpanel" hidden>
+    <button id="d-back" class="clear">&larr; Back to board</button>
+    <h2 id="d-name">—</h2>
+    <p class="lede" id="d-sub">—</p>
+    <div class="factors" id="d-factors"></div>
+    <h3>How to farm it</h3>
+    <ol class="steps" id="d-steps"></ol>
+  </section>
+
+  <section id="tab-model" class="tabpanel" hidden>
+    <h2>How the value is built</h2>
+    <p class="lede">Every number below comes from the snapshot's own figures — no list of
+    names, no outside price. A protocol's implied value is what its token would be worth
+    if the protocol's record stayed as it is.</p>
+    <div class="model">
+      <p><b>Multiple.</b> For each category, the peers are the protocols in that category
+      whose token already trades and whose market cap is recorded: their market-cap-to-TVL
+      ratio, capped at 2.0&times;, and the median of those ratios is the category benchmark.
+      A category with few peers is shrunk toward the market median (0.2138&times;) with a
+      prior weight of k&nbsp;=&nbsp;3 — so a multiple resting on one peer is pulled most of
+      the way toward the market, and a multiple resting on many peers stands on its own.</p>
+      <p><b>Implied value.</b> TVL &times; multiple &times; growth &times; maturity &times;
+      chain reach. Growth is the seven-day TVL change, clamped to &minus;50%…+100% and
+      halved. Maturity is 0.6 plus up to 0.4 for up to three years tracked with no token.
+      Chain reach is 1 plus 0.02 per extra chain, up to five.</p>
+      <p><b>Thin evidence, stated plainly.</b> Risk Curators rests on 1 peer (its ratio is
+      capped at 2.0&times;); Prediction Market rests on 1 peer whose recorded ratio is
+      400&times; and is likewise capped at 2.0&times;. Categories with no live peer at all
+      use the market median. The multiple shown for each protocol names its peer count,
+      so a reader can see how much evidence stands behind it.</p>
+      <p><b>What the board leaves out, and why.</b> A protocol is ranked only if it records
+      no token. Wrapped, staked and bridged products of a token that already trades are set
+      aside, as are exchanges and version-marked copies — they are not launches. Live-token
+      protocols are listed under Already trading, never ranked.</p>
+      <p><b>Headline numbers.</b> <span id="m-numbers">198 pre-token rows, 40 of them the
+      watchlist; market median 0.2138&times;; shrinkage prior k&nbsp;=&nbsp;3.</span></p>
+    </div>
+  </section>
+
+  <section id="tab-trading" class="tabpanel" hidden>
+    <h2>Already trading — set aside, not ranked</h2>
+    <p class="lede"><span id="t-count">416</span> protocols in the snapshot already trade a
+    token. The radar does not rank them: a launch radar is about what does not exist yet.
+    The largest of them are listed below; the rest are counted, not shown.</p>
+    <table><thead><tr><th>Protocol</th><th>Category</th><th>TVL</th><th>Token</th></tr></thead>
+    <tbody id="t-body"></tbody></table>
+  </section>
+
+  <footer>Implied value is this entry's own claim, never make.fun's. The snapshot is
+  DefiLlama's public protocol index as fetched once for this competition; it does not move.
+  A protocol that records no token may still have one its record does not carry.</footer>
+</main>
 <script src="app.js"></script>
 </body>
 </html>

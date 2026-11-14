@@ -1,144 +1,137 @@
-// main.ts — Token Radar v2 entrypoint.
+// token-radar-01 v3 — entrypoint.
+// Reads the sealed snapshot, builds the ranked board, writes the dashboard's data
+// into /output, copies dashboard/ and screenshots/ to /output, and writes
+// /output/dossier.json with buildDossier from vendor/makefun-board.ts.
+// Re-authored in this session from the spec in rebuild-v3/ROUND1.md.
 //
-// Reads the sealed snapshot, builds the ranked board, writes the dashboard
-// and the dossier. Standard library only; runs on Node 22 with no flags.
-//
-//   MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
-//
-// The grader runs the program twice with /input/snapshot.json and /output,
-// and both runs must write the same bytes. Everything here is deterministic:
-// no clocks, no random ids, files written in sorted order, JSON with fixed
-// key order and indentation.
-//
-// Layout of the repository (and of /output after a run):
-//   main.ts                 this file
-//   lib/model.ts            value model, composition, farm plans
-//   vendor/makefun-board.ts the kit's dossier library (copied verbatim)
-//   dashboard/              index.html, app.css, app.js (authored; app.js
-//                           carries a __BOARD_DATA_JSON__ placeholder the
-//                           program fills with the compact board)
-//   screenshots/            three rendered shots of the dashboard
-//   LICENSE                 MIT
+// Run: mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
 
-import {
-  readFileSync,
-  writeFileSync,
-  mkdirSync,
-  readdirSync,
-  copyFileSync,
-} from "node:fs";
-import { join, dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { buildDossier } from "./vendor/makefun-board.ts";
-import {
-  buildBoard,
-  compactRows,
-  SHRINKAGE_K,
-  type Snapshot,
-} from "./lib/model.ts";
+import { readFileSync, writeFileSync, mkdirSync, cpSync, existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildBoard } from './lib/model.ts';
+import { buildDossier } from './vendor/makefun-board.ts';
+import type { Snapshot } from './lib/model.ts';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
-const DEFAULT_INPUT = "/input/snapshot.json";
-const DEFAULT_OUTPUT = "/output";
+const root = dirname(fileURLToPath(import.meta.url));
 
-function arg(name: string): string | undefined {
-  const i = process.argv.indexOf(name);
+function argValue(flag: string): string | undefined {
+  const i = process.argv.indexOf(flag);
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
 }
 
-function main(): void {
-  const input = arg("--input") ?? DEFAULT_INPUT;
-  const output =
-    arg("--output") ?? process.env.MAKEFUN_OUTPUT_DIR ?? DEFAULT_OUTPUT;
-  const snapshot = JSON.parse(readFileSync(input, "utf8")) as Snapshot;
-  const { rows, stats } = buildBoard(snapshot);
+const inputPath =
+  argValue('--input') ??
+  process.env.MAKEFUN_INPUT ??
+  (existsSync('/input/snapshot.json') ? '/input/snapshot.json' : 'input/snapshot.json');
+const outDir =
+  argValue('--output') ?? process.env.MAKEFUN_OUTPUT_DIR ?? 'out';
 
-  const outDir = resolve(output);
-  const dashDir = join(outDir, "dashboard");
-  const shotsDir = join(outDir, "screenshots");
-  mkdirSync(dashDir, { recursive: true });
-  mkdirSync(shotsDir, { recursive: true });
+const snap = JSON.parse(readFileSync(inputPath, 'utf8')) as Snapshot;
+const { rows, marketMedian, totalImplied, liveTokenCount, liveTokenTop } = buildBoard(snap);
 
-  // board.json — the ranked board plus a summary of the model that built it.
-  const board = {
-    as_of: stats.asOf,
-    floor_usd: stats.floorUsd,
-    rows,
-    total_implied_usd: stats.totalImpliedUsd,
-    model: {
-      market_median: stats.marketMedian,
-      shrinkage_k: SHRINKAGE_K,
-      peer_protocols: stats.peerProtocols,
-      tokenized_without_mcap: stats.tokenizedNoMcap,
-      composition:
-        "watchlist (as read) + below-floor pre-token protocols passing the base filters, the parent-brand guard and the category exclusion",
-      age_default_days: 365,
-    },
-  };
-  writeFileSync(
-    join(outDir, "board.json"),
-    JSON.stringify(board, null, 2) + "\n",
-    "utf8",
-  );
-
-  // dashboard — copy the authored page, then fill the board data into app.js.
-  // The placeholder is replaced with the compact board, so the page and the
-  // board can never disagree about a number, and the farm steps the page
-  // shows are generated from the same rules as the board's.
-  const dashSrc = join(ROOT, "dashboard");
-  const indexHtml = readFileSync(join(dashSrc, "index.html"), "utf8");
-  const appCss = readFileSync(join(dashSrc, "app.css"), "utf8");
-  const appJsTemplate = readFileSync(join(dashSrc, "app.js"), "utf8");
-  const dataJson = JSON.stringify({
-    asOf: stats.asOf,
-    floorUsd: stats.floorUsd,
-    marketMedian: stats.marketMedian,
-    totalImpliedUsd: stats.totalImpliedUsd,
-    watchlistCovered: stats.watchlistCovered,
-    watchlistTotal: stats.watchlistTotal,
-    rows: compactRows(rows),
-  });
-  const placeholder = "__BOARD_DATA_JSON__";
-  if (appJsTemplate.split(placeholder).length !== 2) {
-    throw new Error(
-      `app.js must carry exactly one ${placeholder} placeholder`,
-    );
+// Self-checks: a bad board fails loudly here, never silently.
+if (rows.length < 100) throw new Error(`board too small: ${rows.length} rows`);
+for (let i = 0; i < rows.length; i++) {
+  if (rows[i].rank !== i + 1) throw new Error(`rank break at ${i}`);
+  if (i > 0 && rows[i].implied_value_usd > rows[i - 1].implied_value_usd) {
+    throw new Error(`implied value rises at rank ${rows[i].rank}`);
   }
-  const appJs = appJsTemplate.replace(placeholder, () => dataJson);
-  writeFileSync(join(dashDir, "index.html"), indexHtml, "utf8");
-  writeFileSync(join(dashDir, "app.css"), appCss, "utf8");
-  writeFileSync(join(dashDir, "app.js"), appJs, "utf8");
-
-  // screenshots — the three rendered shots, copied in name order. (On the
-  // first local build they do not exist yet; the run stops here after writing
-  // board.json and the dashboard, which is what the shots are rendered from.
-  // The submitted repository carries the shots, so the graded runs succeed.)
-  const shotsSrc = join(ROOT, "screenshots");
-  const shots = readdirSync(shotsSrc)
-    .filter((f) => /\.(png|jpe?g)$/i.test(f))
-    .sort();
-  if (shots.length < 3) {
-    throw new Error(
-      `need at least 3 screenshots in screenshots/, found ${shots.length}`,
-    );
+  if (rows[i].farm_steps.length < 3 || rows[i].farm_steps.length > 12) {
+    throw new Error(`farm_steps count at rank ${rows[i].rank}`);
   }
-  for (const f of shots) {
-    copyFileSync(join(shotsSrc, f), join(shotsDir, f));
+  for (const s of rows[i].farm_steps) {
+    if (s.trim().length < 20 || s.trim().length > 600) {
+      throw new Error(`farm step length at rank ${rows[i].rank}`);
+    }
   }
-
-  // dossier.json — byte for byte what buildDossier writes from dashboard/
-  // and screenshots/. The gate checks this equality, so the dossier is never
-  // hand-written or edited after the program writes it.
-  const dossier = buildDossier(outDir, { text_max_bytes: 65536 });
-  writeFileSync(join(outDir, "dossier.json"), dossier);
-
-  console.log(
-    `token-radar v2: ${rows.length} rows, ` +
-      `${stats.watchlistCovered}/${stats.watchlistTotal} watchlist, ` +
-      `total implied $${stats.totalImpliedUsd.toLocaleString("en-US")}, ` +
-      `market median ${stats.marketMedian}, ` +
-      `${stats.peerProtocols} peer protocols`,
-  );
+}
+const watchCovered = rows.filter((r) => r.watchlist).length;
+if (watchCovered !== snap.watchlist.length) {
+  throw new Error(`watchlist coverage ${watchCovered}/${snap.watchlist.length}`);
 }
 
-main();
+mkdirSync(join(outDir, 'dashboard'), { recursive: true });
+mkdirSync(join(outDir, 'screenshots'), { recursive: true });
+
+// board.json: the ranked board, plus the model's headline numbers.
+writeFileSync(
+  join(outDir, 'board.json'),
+  JSON.stringify({
+    rows,
+    meta: {
+      market_median: marketMedian,
+      shrinkage_k: 3,
+      rows: rows.length,
+      total_implied_usd: totalImplied,
+      as_of: snap.as_of,
+    },
+  }),
+);
+
+// Dashboard data, compact positional rows so the dossier's source text stays
+// whole under its 65,536-byte cap. Schema (decoded in dashboard/app.js):
+//   cats: category names by index
+//   rows: [slug, name, catIdx, chainsPipe (first 3, "|" joined), chainCount,
+//          tvl, change_7d|null, age_days|null, multiple, implied, watch 1/0,
+//          category_median, peers, growth, maturity, chain]
+//   liveTop: [name, category, tvl, symbol] of the largest live-token protocols,
+//   shown set aside, never ranked.
+const cats: string[] = [];
+const catIdx = new Map<string, number>();
+for (const r of rows) {
+  const c = r.category ?? '';
+  if (!catIdx.has(c)) {
+    catIdx.set(c, cats.length);
+    cats.push(c);
+  }
+}
+const compactRows = rows.map((r) => [
+  r.slug,
+  r.name,
+  catIdx.get(r.category ?? '') ?? 0,
+  r.chains.slice(0, 3).join('|'),
+  r.chains.length,
+  r.tvl_usd,
+  r.change_7d,
+  r.age_days,
+  r.multiple,
+  r.implied_value_usd,
+  r.watchlist ? 1 : 0,
+  r.model.category_median,
+  r.model.peers,
+  r.model.growth,
+  r.model.maturity,
+  r.model.chain,
+]);
+const data = {
+  cats,
+  M: marketMedian,
+  k: 3,
+  total: totalImplied,
+  liveCount: liveTokenCount,
+  liveTop: liveTokenTop.map((p) => [p.name, p.category ?? '', p.tvl_usd, p.symbol ?? '']),
+  rows: compactRows,
+};
+const dataJson = JSON.stringify(data);
+
+const indexHtml = readFileSync(join(root, 'dashboard', 'index.html'), 'utf8');
+const appCss = readFileSync(join(root, 'dashboard', 'app.css'), 'utf8');
+let appJs = readFileSync(join(root, 'dashboard', 'app.js'), 'utf8');
+const placeholderCount = appJs.split('__BOARD_DATA_JSON__').length - 1;
+if (placeholderCount !== 1) {
+  throw new Error(`__BOARD_DATA_JSON__ appears ${placeholderCount} times in app.js (must be 1)`);
+}
+appJs = appJs.replace('__BOARD_DATA_JSON__', dataJson);
+
+writeFileSync(join(outDir, 'dashboard', 'index.html'), indexHtml);
+writeFileSync(join(outDir, 'dashboard', 'app.css'), appCss);
+writeFileSync(join(outDir, 'dashboard', 'app.js'), appJs);
+cpSync(join(root, 'screenshots'), join(outDir, 'screenshots'), { recursive: true });
+
+const dossier = buildDossier(outDir, { text_max_bytes: 65536 });
+writeFileSync(join(outDir, 'dossier.json'), dossier);
+
+console.log(`board: ${rows.length} rows, total implied $${totalImplied.toLocaleString('en-US')}`);
+console.log(`market median ${marketMedian}, top: ${rows.slice(0, 3).map((r) => r.name).join(', ')}`);
+console.log(`dossier: ${dossier.length} bytes`);

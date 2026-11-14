@@ -1,318 +1,303 @@
-// app.js — Token Radar dashboard.
-// The board data is injected by main.ts (it replaces the data placeholder in
-// this file with the compact board). The page renders the board, the detail
-// view and the multiples table, and regenerates each protocol's farm plan
-// client-side with the same generator the board was built with, so the page
-// and board.json can never disagree about a plan.
-//
-// Compact row layout:
-// [rank, slug, name, category, chains, tvl, implied, change_7d, age_days,
-//  multiple, peers, category_median, growth, maturity, chain]
+// Token Radar dashboard: renders the board from the embedded data, filters and
+// sorts it, shows a detail view per protocol, and generates each farm plan.
+// The farm-step generator below is a faithful port of lib/model.ts: same category
+// templates, same amounts, same costs and times. Board data schema (embedded by
+// main.ts as compact positional rows):
+//   cats: category names by index
+//   rows: [slug, name, catIdx, chainsPipe (first 3, "|" joined), chainCount,
+//          tvl, change_7d|null, age_days|null, multiple, implied, watch 1/0,
+//          category_median, peers, growth, maturity, chain]
+//   liveTop: [name, category, tvl, symbol] of the largest live-token protocols.
 
-const BOARD_DATA = __BOARD_DATA_JSON__;
+const DATA = __BOARD_DATA_JSON__;
 
-const META = {
-  asOf: BOARD_DATA.asOf,
-  floorUsd: BOARD_DATA.floorUsd,
-  marketMedian: BOARD_DATA.marketMedian,
-  totalImpliedUsd: BOARD_DATA.totalImpliedUsd,
-  watchlistCovered: BOARD_DATA.watchlistCovered,
-  watchlistTotal: BOARD_DATA.watchlistTotal,
-};
-const ROWS = BOARD_DATA.rows.map((r) => ({
-  rank: r[0], slug: r[1], name: r[2], category: r[3], chains: r[4],
-  tvl: r[5], implied: r[6], chg: r[7], age: r[8], mult: r[9], peers: r[10],
-  median: r[11], growth: r[12], maturity: r[13], chain: r[14],
+const rows = DATA.rows.map((r, i) => ({
+  slug: r[0],
+  name: r[1],
+  cat: DATA.cats[r[2]] || '',
+  chains: r[3] ? r[3].split('|') : [],
+  chainCount: r[4],
+  tvl: r[5],
+  chg: r[6],
+  age: r[7],
+  mult: r[8],
+  impl: r[9],
+  watch: r[10] === 1,
+  med: r[11],
+  peers: r[12],
+  growth: r[13],
+  maturity: r[14],
+  chainF: r[15],
+  rank: i + 1,
 }));
+const maxImpl = rows.length ? rows[0].impl : 1;
 
-// --- Farm plans: the same generator as lib/model.ts farmSteps() -----------
-function farmCapital(tvl) {
-  if (tvl >= 1000000000) return 150;
-  if (tvl >= 100000000) return 100;
-  return 50;
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
-function farmHoldDays(age) {
-  if (age === null || age === undefined) return 30;
-  if (age < 180) return 60;
-  if (age < 365) return 45;
-  return 30;
+
+function fmtMoney(v) {
+  if (v >= 1e9) return '$' + trimNum(v / 1e9, 2) + 'B';
+  if (v >= 1e6) return '$' + trimNum(v / 1e6, 1) + 'M';
+  return '$' + Math.round(v / 1000) + 'K';
 }
-function articleFor(name) {
-  return /^[aeiou]/i.test(name.trim()) ? "an" : "a";
+
+function trimNum(v, dp) {
+  const s = v.toFixed(dp);
+  return s.replace(/\.?0+$/, '');
 }
-const STEP2 = {
-  "Risk Curators": "vault", "Onchain Capital Allocator": "vault",
-  "Yield": "yield-vault", "Yield Aggregator": "yield-vault",
-  "Farm": "farm", "Liquidity Manager": "managed",
-  "Anchor BTC": "deposit", "CeDeFi": "deposit",
-  "Crypto Card Issuer": "deposit", "Decentralized BTC": "deposit",
-  "Governance Incentives": "deposit",
-  "Lending": "supply", "Collateral Markets": "supply",
-  "Uncollateralized Lending": "supply",
-  "Dexs": "liquidity", "Indexes": "liquidity", "Leveraged Farming": "liquidity",
-  "Basis Trading": "margin", "Derivatives": "margin",
-  "Interest Rate Derivatives": "margin",
-  "CDP": "mint-stable",
-  "Dual-Token Stablecoin": "mint-stable-asset",
-  "Stablecoin Wrapper": "mint-stable-asset",
-  "Chain": "bridge-chain", "Insurance": "cover", "Payments": "payment",
-  "Prediction Market": "predict", "RWA": "mint-yield-asset",
-  "Restaking": "stake", "Staking Pool": "stake",
+
+function fmtAge(age) {
+  if (age === null || age === undefined) return '—';
+  if (age < 60) return age + 'd';
+  if (age < 730) return Math.round(age / 30.44) + ' mo';
+  return (age / 365).toFixed(1) + 'y';
+}
+
+function fmtChg(c) {
+  if (c === null || c === undefined) return '—';
+  const s = (c > 0 ? '+' : '') + c.toFixed(1) + '%';
+  return '<span class="' + (c >= 0 ? 'up' : 'down') + '">' + s + '</span>';
+}
+
+function article(name) {
+  const c = (name || '').slice(0, 1).toLowerCase();
+  return c === 'a' || c === 'e' || c === 'i' || c === 'o' || c === 'u' ? 'an' : 'a';
+}
+
+// --- farm-step generator (port of lib/model.ts) ---
+const CAT = {
+  'Risk Curators': ['Deposit ${amt} into {art} {name} vault on {chain} and keep the shares.', 'vaults', 'a deposit, a vote or a rebalance'],
+  'Onchain Capital Allocator': ['Deposit ${amt} into {art} {name} vault on {chain} and keep the shares.', 'vaults', 'a deposit, a withdrawal or a vote'],
+  Dexs: ['Swap ${amt} through {name} on {chain} and add ${amt2} of liquidity to its deepest pool.', 'pools', 'a swap, a liquidity add or a vote'],
+  Lending: ['Supply ${amt} of stablecoins to {name} on {chain} and borrow ${amt2} against the supply.', 'markets', 'a supply, a borrow or a repayment'],
+  'Prediction Market': ['Place ${amt} across two outcomes on {name} on {chain} and leave both positions open.', 'markets', 'a new bet, a cash-out or a vote'],
+  CDP: ['Mint ${amt} of the stablecoin by locking collateral in {name} on {chain}.', 'vaults', 'a mint, a repayment or a collateral top-up'],
+  'CDP Manager': ['Open a ${amt} vault in {name} on {chain} and manage the collateral ratio weekly.', 'vaults', 'a vault rebalance, a repayment or a top-up'],
+  RWA: ['Buy ${amt} of the tokenised asset on {name} on {chain} and hold the receipt.', 'holdings', 'a buy, a redemption or a vote'],
+  Yield: ['Deposit ${amt} into the highest-yield {name} vault on {chain}.', 'vaults', 'a deposit, a harvest or a vault switch'],
+  'Yield Aggregator': ['Deposit ${amt} into the highest-yield {name} vault on {chain}.', 'vaults', 'a deposit, a harvest or a vault switch'],
+  Derivatives: ['Open one small hedged position of ${amt} on {name} on {chain}.', 'positions', 'a hedge, a close or a rebalance'],
+  'Basis Trading': ['Open a ${amt} basis position on {name} on {chain} and hold it through one funding cycle.', 'positions', 'a basis open, a close or a roll'],
+  Chain: ['Use ${amt} across two apps on {name} on {chain} and keep the wallet active.', 'apps', 'an app use, a swap or a vote'],
+  'Staking Pool': ['Stake ${amt} in the {name} pool on {chain} and keep the stake through one epoch.', 'pools', 'a stake, an unstake or a claim'],
+  'Liquidity Manager': ['Deposit ${amt} into a {name} managed position on {chain}.', 'positions', 'a deposit, a rebalance or a withdrawal'],
+  'Leveraged Farming': ['Open a ${amt} leveraged farm on {name} on {chain} at low leverage.', 'farms', 'a farm open, a harvest or a deleverage'],
+  Restaking: ['Restake ${amt} through {name} on {chain} and keep the position through one epoch.', 'positions', 'a restake, a claim or a withdrawal'],
+  'Anchor BTC': ['Lock ${amt} of BTC value in {name} on {chain} and hold the receipt.', 'vaults', 'a lock, a mint or a redemption'],
+  'Decentralized BTC': ['Lock ${amt} of BTC value in {name} on {chain} and hold the receipt.', 'vaults', 'a lock, a mint or a redemption'],
+  CeDeFi: ['Deposit ${amt} into {name} on {chain} and use one of its CeDeFi vaults.', 'vaults', 'a deposit, a vault use or a withdrawal'],
+  'Dual-Token Stablecoin': ['Mint ${amt} of the stablecoin pair on {name} on {chain}.', 'vaults', 'a mint, a burn or a swap'],
+  'Uncollateralized Lending': ['Lend ${amt} through {name} on {chain} to one borrower pool.', 'pools', 'a lend, a repayment or a claim'],
+  'Interest Rate Derivatives': ['Open a ${amt} rate position on {name} on {chain}.', 'positions', 'a rate open, a close or a roll'],
+  Insurance: ['Buy ${amt} of cover on {name} on {chain} for one of its listed protocols.', 'policies', 'a cover buy, a claim or a renewal'],
+  Farm: ['Deposit ${amt} into the top farm on {name} on {chain}.', 'farms', 'a deposit, a harvest or a farm switch'],
+  Payments: ['Send ${amt} through {name} on {chain} and keep the wallet active weekly.', 'payments', 'a payment, a top-up or a vote'],
+  'Governance Incentives': ['Lock ${amt} in governance on {name} on {chain} and vote on one proposal.', 'votes', 'a lock, a vote or a claim'],
+  'Crypto Card Issuer': ['Spend ${amt} through the {name} card on {chain} and keep the card active.', 'payments', 'a spend, a top-up or a vote'],
+  'Stablecoin Wrapper': ['Wrap ${amt} through {name} on {chain} and hold the wrapped balance.', 'balances', 'a wrap, an unwrap or a swap'],
+  Indexes: ['Buy ${amt} of the {name} index on {chain} and hold it.', 'holdings', 'a buy, a rebalance or a sale'],
+  'Collateral Markets': ['Post ${amt} of collateral on {name} on {chain}.', 'positions', 'a post, a borrow or a withdrawal'],
+  'OTC Marketplace': ['Place a ${amt} order on {name} on {chain} and settle it.', 'orders', 'an order, a settlement or a vote'],
+  'Cross Chain Bridge': ['Bridge ${amt} through {name} on {chain} and keep the receipt.', 'bridges', 'a bridge, a claim or a swap'],
 };
-const STEP3 = {
-  "Risk Curators": "vault-move", "Onchain Capital Allocator": "vault-move",
-  "Yield": "harvest", "Yield Aggregator": "harvest",
-  "Farm": "rebalance", "Liquidity Manager": "rebalance",
-  "Anchor BTC": "generic", "CeDeFi": "generic", "Chain": "generic",
-  "Crypto Card Issuer": "generic", "Decentralized BTC": "generic",
-  "Governance Incentives": "generic",
-  "CDP": "borrow", "Lending": "borrow", "Collateral Markets": "borrow",
-  "Uncollateralized Lending": "borrow",
-  "Dexs": "swap-pool", "Indexes": "swap-pool", "Leveraged Farming": "swap-pool",
-  "Basis Trading": "hedge", "Derivatives": "hedge",
-  "Interest Rate Derivatives": "hedge",
-  "Dual-Token Stablecoin": "swap-stable", "Stablecoin Wrapper": "swap-stable",
-  "Insurance": "cover2", "Payments": "payment2",
-  "Prediction Market": "predict2", "RWA": "rwa-redeem",
-  "Restaking": "stake2", "Staking Pool": "stake2",
-};
-function step2Text(kind, name, chain0, cap, gas) {
-  const cost = " Cost: $" + cap + " of capital and about $" + gas +
-    " of gas. Time: 15 minutes to set up.";
-  switch (kind) {
-    case "vault": return "Deposit $" + cap + " into " + articleFor(name) + " " + name + " vault on " + chain0 + " and keep the shares." + cost;
-    case "yield-vault": return "Deposit $" + cap + " into " + name + "'s highest-yield vault on " + chain0 + " and keep the shares." + cost;
-    case "farm": return "Deposit $" + cap + " into " + name + "'s main farm on " + chain0 + " and keep the position staked." + cost;
-    case "managed": return "Deposit $" + cap + " into " + articleFor(name) + " " + name + " managed position on " + chain0 + " and keep it open." + cost;
-    case "deposit": return "Deposit $" + cap + " of USDC into " + name + " on " + chain0 + " and keep the position open." + cost;
-    case "supply": return "Supply $" + cap + " of USDC to " + name + " on " + chain0 + " and keep the position open." + cost;
-    case "liquidity": return "Provide $" + cap + " of liquidity to " + name + "'s main pool on " + chain0 + " and keep the position open." + cost;
-    case "margin": return "Deposit $" + cap + " of USDC as margin on " + name + " and open one small hedged position." + cost;
-    case "mint-stable": return "Mint $" + cap + " of the stablecoin by locking collateral in " + name + " on " + chain0 + "." + cost;
-    case "mint-stable-asset": return "Mint or deposit $" + cap + " of the stable asset through " + name + " on " + chain0 + "." + cost;
-    case "bridge-chain": return "Bridge $" + cap + " onto the chain " + name + " secures and use one of its apps." + cost;
-    case "cover": return "Buy $" + cap + " of cover from " + name + " on " + chain0 + " and keep the policy active." + cost;
-    case "payment": return "Send one $" + cap + " payment through " + name + " on " + chain0 + " and keep the receipt." + cost;
-    case "predict": return "Fund $" + cap + " and place one market position on " + name + "." + cost;
-    case "mint-yield-asset": return "Mint $" + cap + " of the protocol's yield-bearing asset on " + chain0 + " and hold it." + cost;
-    case "stake": return "Stake $" + cap + " of the chain's staking asset through " + name + " and keep the receipt token." + cost;
-    default: return "Deposit $" + cap + " of USDC into " + name + " on " + chain0 + " and keep the position open." + cost;
-  }
-}
-function step3Text(kind, name) {
-  const cost = " Cost: about $25 of activity and $2 of gas. Time: 10 minutes.";
-  switch (kind) {
-    case "vault-move": return "Move $25 between two of " + name + "'s vaults, so the wallet shows activity in more than one." + cost;
-    case "harvest": return "Claim or compound the yield once, so the wallet shows a harvest from " + name + "." + cost;
-    case "rebalance": return "Rebalance the position once, so the wallet shows a second transaction on " + name + "." + cost;
-    case "generic": return "Make one more qualifying action of a different kind than the first on " + name + "." + cost;
-    case "borrow": return "Borrow $25 against the supply and repay it a week later, so the wallet shows both sides of " + name + "." + cost;
-    case "swap-pool": return "Swap $25 through the same pool once, so the wallet shows a trade as well as liquidity on " + name + "." + cost;
-    case "hedge": return "Close the hedge and open a fresh one, so the wallet shows two round trips on " + name + "." + cost;
-    case "swap-stable": return "Swap $25 of the stable asset through " + name + "'s own route." + cost;
-    case "cover2": return "Open a second small cover on another pool of " + name + "." + cost;
-    case "payment2": return "Make a second $25 payment to a different address through " + name + "." + cost;
-    case "predict2": return "Settle one market and open another, so the wallet shows two positions on " + name + "." + cost;
-    case "rwa-redeem": return "Redeem a small part of the yield asset and re-mint it through " + name + "." + cost;
-    case "stake2": return "Delegate a second small stake through " + name + " and keep both receipts." + cost;
-    default: return "Make one more qualifying action of a different kind than the first on " + name + "." + cost;
-  }
-}
+const DEFAULT_CAT = ['Use {name} on {chain} with ${amt} and keep the position open.', 'positions', 'a deposit, a borrow, a swap or a vote'];
+
 function farmSteps(row) {
-  const cap = farmCapital(row.tvl);
-  const gas = cap === 150 ? 8 : 4;
-  const hold = farmHoldDays(row.age);
-  const chain0 = row.chains[0] || "its chain";
-  const kind2 = STEP2[row.category] || "deposit";
-  const kind3 = STEP3[row.category] || "generic";
-  const step4 = row.chains.length >= 2
-    ? "Make one qualifying action each week, rotating across two of its chains (" + row.chains[0] + " and " + row.chains[1] + "), such as a deposit, a borrow, a swap or a vote. Cost: about $2 of gas a week. Time: 10 minutes a week."
-    : "Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote. Cost: about $2 of gas a week. Time: 10 minutes a week.";
+  const name = row.name;
+  const chains = row.chains.length ? row.chains : ['Ethereum'];
+  const chain = chains[0];
+  const tvl = row.tvl;
+  const amt = tvl >= 1e9 ? 150 : tvl >= 1e8 ? 100 : 50;
+  const gas = tvl >= 1e9 ? 8 : tvl >= 1e8 ? 6 : 4;
+  const ageInternal = row.age === null ? 365 : row.age;
+  const hold = ageInternal < 180 ? 30 : ageInternal < 540 ? 45 : 60;
+  const plan = CAT[row.cat] || DEFAULT_CAT;
+  // Replace only the {amt}/{amt2} placeholders: the "$" in front of them is
+  // literal template text ("Deposit ${amt}" -> "Deposit $150"). Replacing the
+  // whole "${amt}" token would swallow the dollar sign.
+  let step2 = plan[0].split('{amt}').join(String(amt)).split('{amt2}').join('25')
+    .split('{name}').join(name).split('{chain}').join(chain).split('{art}').join(article(name));
+  step2 += ' Cost: $' + amt + ' of capital and about $' + gas + ' of gas. Time: 15 minutes to set up.';
+  const chainClause = chains.length >= 2
+    ? ', rotating across two of its chains (' + chains[0] + ' and ' + chains[1] + ')'
+    : '';
   return [
-    "Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Cost: under $3 of gas for the first transaction. Time: 5 minutes.",
-    step2Text(kind2, row.name, chain0, cap, gas),
-    step3Text(kind3, row.name),
-    step4,
-    "Hold the position for at least " + hold + " days so the activity is counted in more than one snapshot. Cost: the $" + cap + " stays in the position. Time: " + hold + " days.",
+    'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline. Cost: under $3 of gas for the first transaction. Time: 5 minutes.',
+    step2,
+    'Move $25 between two of ' + name + "'s " + plan[1] + ', so the wallet shows activity in more than one. Cost: about $25 of activity and $2 of gas. Time: 10 minutes.',
+    'Make one qualifying action each week' + chainClause + ', such as ' + plan[2] + '. Cost: about $2 of gas a week. Time: 10 minutes a week.',
+    'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot. Cost: the $' + amt + ' stays in the position. Time: ' + hold + ' days.',
     "Before you withdraw, open the protocol's own points or rewards page and claim only from the link it publishes. Cost: no fee to check, and never pay to claim. Time: 10 minutes.",
-    "Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it. Cost: nothing but the log. Time: 5 minutes.",
+    'Write the wallet, the dates and every transaction in a farm log so you can repeat the position or unwind it. Cost: nothing but the log. Time: 5 minutes.',
   ];
 }
 
-// --- Formatting ------------------------------------------------------------
-function fmtMoney(n) {
-  if (n >= 1000000000) return "$" + (n / 1000000000).toFixed(2) + "B";
-  if (n >= 1000000) return "$" + (n / 1000000).toFixed(n >= 100000000 ? 0 : 1) + "M";
-  if (n >= 1000) return "$" + (n / 1000).toFixed(0) + "K";
-  return "$" + n;
-}
-function fmtPct(c) {
-  if (c === null || c === undefined) return "—";
-  return (c >= 0 ? "+" : "") + c.toFixed(1) + "%";
-}
-function fmtAge(a) {
-  if (a === null || a === undefined) return "unknown";
-  return a + "d";
-}
-function esc(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
-// --- State -----------------------------------------------------------------
-let sortKey = "rank";
-let sortDir = 1;
+// --- rendering ---
 const $ = (id) => document.getElementById(id);
+const state = { q: '', cat: '', chain: '', minTvl: 0, sortKey: 'rank', sortDir: 1, live: false };
 
-function filteredRows() {
-  const q = $("q").value.trim().toLowerCase();
-  const cat = $("cat").value;
-  let rows = ROWS.filter((r) => {
-    if (cat && r.category !== cat) return false;
-    if (q && !(r.name.toLowerCase().includes(q) ||
-      r.slug.includes(q) || r.category.toLowerCase().includes(q))) return false;
-    return true;
-  });
-  const key = sortKey;
-  const dir = sortDir;
-  rows = rows.slice().sort((a, b) => {
-    let d = 0;
-    if (key === "rank") d = a.rank - b.rank;
-    else if (key === "implied") d = b.implied - a.implied;
-    else if (key === "tvl") d = b.tvl - a.tvl;
-    else if (key === "age") d = (b.age === null ? -1 : b.age) - (a.age === null ? -1 : a.age);
-    else if (key === "name") d = a.name.localeCompare(b.name);
-    else if (key === "category") d = a.category.localeCompare(b.category);
-    else if (key === "mult") d = b.mult - a.mult;
-    return d * (key === "rank" ? 1 : dir);
-  });
-  return rows;
+function chainsLabel(row) {
+  const shown = row.chains.slice(0, 3).join(', ');
+  const extra = row.chainCount - row.chains.length;
+  return shown + (extra > 0 ? ' +' + extra : '');
 }
 
 function renderBoard() {
-  const rows = filteredRows();
-  const tb = $("rows");
-  tb.innerHTML = rows.map((r) => (
-    "<tr data-slug=\"" + esc(r.slug) + "\">" +
-    "<td class=\"rank num\">" + r.rank + "</td>" +
-    "<td class=\"name\">" + esc(r.name) + "<small>" + esc(r.slug) + "</small></td>" +
-    "<td>" + esc(r.category) + "</td>" +
-    "<td>" + esc(r.chains.slice(0, 3).join(", ")) + (r.chains.length > 3 ? " +" + (r.chains.length - 3) : "") + "</td>" +
-    "<td class=\"num\">" + fmtMoney(r.tvl) + "</td>" +
-    "<td class=\"num\">" + fmtPct(r.chg) + "</td>" +
-    "<td class=\"num\">" + fmtAge(r.age) + "</td>" +
-    "<td class=\"num imp\">" + fmtMoney(r.implied) + "</td>" +
-    "<td class=\"num mult\">" + r.mult.toFixed(4) + "×</td>" +
-    "</tr>"
-  )).join("");
-  $("count").textContent = rows.length + " of " + ROWS.length +
-    " protocols · click a row for its detail and farm plan.";
-  tb.querySelectorAll("tr").forEach((tr) => {
-    tr.addEventListener("click", () => { location.hash = "#p=" + tr.dataset.slug; });
+  const body = $('board-body');
+  let list = rows.slice();
+  if (state.q) {
+    const q = state.q.toLowerCase();
+    list = list.filter((r) =>
+      r.name.toLowerCase().includes(q) || r.cat.toLowerCase().includes(q) ||
+      r.chains.join(' ').toLowerCase().includes(q) || r.slug.includes(q));
+  }
+  if (state.cat) list = list.filter((r) => r.cat === state.cat);
+  if (state.chain) list = list.filter((r) => r.chains.includes(state.chain));
+  if (state.minTvl) list = list.filter((r) => r.tvl >= state.minTvl);
+  const key = state.sortKey;
+  const dir = state.sortDir;
+  list.sort((a, b) => {
+    let d = 0;
+    if (key === 'rank' || key === 'impl') d = a.impl - b.impl;
+    else if (key === 'name') d = a.name.localeCompare(b.name);
+    else if (key === 'tvl') d = a.tvl - b.tvl;
+    else if (key === 'chg') d = (a.chg ?? -999) - (b.chg ?? -999);
+    else if (key === 'age') d = (a.age ?? -1) - (b.age ?? -1);
+    else if (key === 'mult') d = a.mult - b.mult;
+    return key === 'rank' ? d * dir : -d * dir;
+  });
+  if (key === 'rank' && dir === 1) list = rows.filter((r) => list.includes(r));
+  body.innerHTML = list.map((r) => {
+    const barW = Math.max(4, Math.round((r.impl / maxImpl) * 120));
+    return '<tr data-slug="' + esc(r.slug) + '">' +
+      '<td class="rank">' + r.rank + '</td>' +
+      '<td><div class="pname">' + esc(r.name) +
+      '<span class="badge' + (r.watch ? '' : ' early') + '">' + (r.watch ? 'Watchlist' : 'Early') + '</span></div>' +
+      '<div class="psub">' + esc(r.cat) + ' on ' + esc(chainsLabel(r)) + '</div></td>' +
+      '<td class="num">' + fmtMoney(r.tvl) + '</td>' +
+      '<td class="num">' + fmtChg(r.chg) + '</td>' +
+      '<td class="num">' + fmtAge(r.age) + '</td>' +
+      '<td class="num">' + r.mult.toFixed(4) + '&times;</td>' +
+      '<td class="num"><span class="bar" style="width:' + barW + 'px"></span>' + fmtMoney(r.impl) + '</td>' +
+      '<td><span class="dot">&#9679; no token</span></td></tr>';
+  }).join('');
+  $('row-count').textContent = list.length + ' rows shown';
+  body.querySelectorAll('tr').forEach((tr) => {
+    tr.addEventListener('click', () => showDetail(tr.getAttribute('data-slug')));
   });
 }
 
-function renderDetail(slug) {
-  const r = ROWS.find((x) => x.slug === slug);
-  const el = $("detail");
-  if (!r) { el.hidden = true; $("boardWrap").hidden = false; return; }
-  const steps = farmSteps(r);
-  el.innerHTML =
-    "<button class=\"back\" id=\"backBtn\" type=\"button\">← Back to the board</button>" +
-    "<h2>" + esc(r.name) + " <small>#" + r.rank + "</small></h2>" +
-    "<p class=\"meta\">" + esc(r.category) + " · " + esc(r.chains.join(", ")) +
-    " · TVL " + fmtMoney(r.tvl) + " · 7d " + fmtPct(r.chg) +
-    " · age " + fmtAge(r.age) + "</p>" +
-    "<h3>Implied value: " + fmtMoney(r.implied) + "</h3>" +
-    "<div class=\"kv\">" +
-    "<div><span>Category multiple</span><b>" + r.mult.toFixed(4) + "×</b></div>" +
-    "<div><span>Category peer median</span><b>" + (r.median === null ? "—" : r.median.toFixed(4) + "×") + "</b></div>" +
-    "<div><span>Tokenized peers</span><b>" + r.peers + "</b></div>" +
-    "<div><span>Market median</span><b>" + META.marketMedian.toFixed(4) + "×</b></div>" +
-    "<div><span>Growth</span><b>×" + r.growth.toFixed(3) + "</b></div>" +
-    "<div><span>Maturity</span><b>×" + r.maturity.toFixed(4) + "</b></div>" +
-    "<div><span>Chains</span><b>×" + r.chain.toFixed(2) + "</b></div>" +
-    "</div>" +
-    "<h3>How to farm it</h3><ol>" +
-    steps.map((s) => "<li>" + esc(s) + "</li>").join("") +
-    "</ol>";
-  el.hidden = false;
-  $("boardWrap").hidden = true;
-  $("backBtn").addEventListener("click", () => { location.hash = ""; });
+function renderLiveInto(tbodyId) {
+  const tb = $(tbodyId);
+  tb.innerHTML = DATA.liveTop.map((p) =>
+    '<tr><td><div class="pname">' + esc(p[0]) + '</div></td>' +
+    '<td>' + esc(p[1]) + '</td>' +
+    '<td class="num">' + fmtMoney(p[2]) + '</td>' +
+    '<td>' + esc(p[3] || '—') + '</td></tr>').join('');
 }
 
-function renderMultTable() {
-  const byCat = {};
-  for (const r of ROWS) {
-    if (!byCat[r.category]) {
-      byCat[r.category] = { peers: r.peers, median: r.median, mult: r.mult };
-    }
-  }
-  const cats = Object.keys(byCat).sort((a, b) => byCat[b].mult - byCat[a].mult);
-  document.querySelector("#multTable tbody").innerHTML = cats.map((c) => (
-    "<tr><td>" + esc(c) + "</td><td class=\"num\">" + byCat[c].peers + "</td>" +
-    "<td class=\"num\">" + (byCat[c].median === null ? "—" : byCat[c].median.toFixed(4) + "×") + "</td>" +
-    "<td class=\"num\">" + byCat[c].mult.toFixed(4) + "×</td></tr>"
-  )).join("");
+function showDetail(slug) {
+  const r = rows.find((x) => x.slug === slug);
+  if (!r) return;
+  document.querySelectorAll('.tabpanel').forEach((s) => { s.hidden = true; });
+  $('tab-detail').hidden = false;
+  $('d-name').textContent = '#' + r.rank + ' ' + r.name;
+  $('d-sub').textContent = r.cat + ' on ' + chainsLabel(r) + ' · TVL ' + fmtMoney(r.tvl) +
+    ' · no token for ' + fmtAge(r.age) + (r.watch ? ' · Watchlist' : ' · Early');
+  const f = [
+    ['Multiple', r.mult.toFixed(4) + '×'],
+    ['Category median', r.med.toFixed(4) + '×'],
+    ['Peers', String(r.peers)],
+    ['Market median', DATA.M.toFixed(4) + '×'],
+    ['Growth', '×' + r.growth.toFixed(4)],
+    ['Maturity', '×' + r.maturity.toFixed(4)],
+    ['Chain reach', '×' + r.chainF.toFixed(2)],
+    ['Implied value', fmtMoney(r.impl)],
+  ];
+  $('d-factors').innerHTML = f.map((x) =>
+    '<div class="factor"><b>' + esc(x[1]) + '</b><span>' + esc(x[0]) + '</span></div>').join('');
+  $('d-steps').innerHTML = farmSteps(r).map((s) => '<li>' + esc(s) + '</li>').join('');
+  window.scrollTo(0, 0);
 }
 
-function renderStats() {
-  $("stats").innerHTML =
-    "<b>" + ROWS.length + "</b> protocols · watchlist <b>" +
-    META.watchlistCovered + "/" + META.watchlistTotal + "</b> · " +
-    "total implied <b>" + fmtMoney(META.totalImpliedUsd) + "</b><br>" +
-    "snapshot " + esc(META.asOf) + " · market median <b>" +
-    META.marketMedian.toFixed(4) + "×</b> · shrinkage prior k = 6";
-  $("asof").textContent = META.asOf;
-  $("mmed").textContent = META.marketMedian.toFixed(4) + "×";
-}
-
-function route() {
-  const h = location.hash || "";
-  const m = h.match(/^#p=([\w-]+)/);
-  if (m) { renderDetail(m[1]); return; }
-  $("detail").hidden = true;
-  $("boardWrap").hidden = false;
-  const c = h.match(/^#category=(.+)/);
-  if (c) {
-    const cat = decodeURIComponent(c[1]);
-    if ([...$("cat").options].some((o) => o.value === cat)) $("cat").value = cat;
-  }
-  renderBoard();
+function showTab(name) {
+  document.querySelectorAll('.tabpanel').forEach((s) => { s.hidden = true; });
+  $('tab-' + name).hidden = false;
+  document.querySelectorAll('.tab').forEach((b) => {
+    b.classList.toggle('active', b.getAttribute('data-tab') === name);
+  });
 }
 
 function init() {
-  const cats = [...new Set(ROWS.map((r) => r.category))].sort();
-  for (const c of cats) {
-    const o = document.createElement("option");
-    o.value = c; o.textContent = c;
-    $("cat").appendChild(o);
-  }
-  $("q").addEventListener("input", renderBoard);
-  $("cat").addEventListener("change", renderBoard);
-  $("sort").addEventListener("change", () => {
-    const v = $("sort").value;
-    if (v === "rank") { sortKey = "rank"; sortDir = 1; }
-    else { sortKey = v; sortDir = 1; }
+  const watchN = rows.filter((r) => r.watch).length;
+  $('stat-watchlist').textContent = watchN + ' / ' + watchN;
+  $('stat-rows').textContent = String(rows.length);
+  $('stat-early').textContent = String(rows.length - watchN);
+  $('stat-live').textContent = String(DATA.liveCount);
+  $('stat-total').textContent = fmtMoney(DATA.total);
+  $('stat-median').textContent = DATA.M.toFixed(4) + '×';
+  $('m-numbers').textContent = rows.length + ' pre-token rows, ' + watchN + ' of them the watchlist; market median ' +
+    DATA.M.toFixed(4) + '×; shrinkage prior k = ' + DATA.k + '.';
+  $('t-count').textContent = String(DATA.liveCount);
+
+  const cats = [...new Set(rows.map((r) => r.cat))].sort();
+  $('f-cat').innerHTML = '<option value="">All categories</option>' +
+    cats.map((c) => '<option>' + esc(c) + '</option>').join('');
+  const chains = [...new Set(rows.flatMap((r) => r.chains))].sort();
+  $('f-chain').innerHTML = '<option value="">All chains</option>' +
+    chains.map((c) => '<option>' + esc(c) + '</option>').join('');
+
+  renderLiveInto('live-body');
+  renderLiveInto('t-body');
+  renderBoard();
+
+  $('q').addEventListener('input', (e) => { state.q = e.target.value; renderBoard(); });
+  $('f-cat').addEventListener('change', (e) => { state.cat = e.target.value; renderBoard(); });
+  $('f-chain').addEventListener('change', (e) => { state.chain = e.target.value; renderBoard(); });
+  $('f-tvl').addEventListener('change', (e) => { state.minTvl = Number(e.target.value); renderBoard(); });
+  $('clear-filters').addEventListener('click', () => {
+    state.q = ''; state.cat = ''; state.chain = ''; state.minTvl = 0;
+    $('q').value = ''; $('f-cat').value = ''; $('f-chain').value = ''; $('f-tvl').value = '0';
     renderBoard();
   });
-  document.querySelectorAll("#board th[data-k]").forEach((th) => {
-    th.addEventListener("click", () => {
-      const k = th.dataset.k;
-      if (sortKey === k) sortDir = -sortDir;
-      else { sortKey = k; sortDir = k === "rank" ? 1 : 1; }
+  $('pill-pre').addEventListener('click', () => {
+    state.live = false;
+    $('pill-pre').classList.add('active');
+    $('pill-live').classList.remove('active');
+    $('board').hidden = false;
+    $('live-list').hidden = true;
+  });
+  $('pill-live').addEventListener('click', () => {
+    state.live = true;
+    $('pill-live').classList.add('active');
+    $('pill-pre').classList.remove('active');
+    $('board').hidden = true;
+    $('live-list').hidden = false;
+  });
+  document.querySelectorAll('th[data-sort]').forEach((th) => {
+    th.addEventListener('click', () => {
+      const k = th.getAttribute('data-sort');
+      if (state.sortKey === k) state.sortDir = -state.sortDir;
+      else { state.sortKey = k; state.sortDir = 1; }
       renderBoard();
     });
   });
-  $("modelToggle").addEventListener("click", () => {
-    const m = $("model");
-    m.hidden = !m.hidden;
-    if (!m.hidden) renderMultTable();
+  document.querySelectorAll('.tab').forEach((b) => {
+    b.addEventListener('click', () => showTab(b.getAttribute('data-tab')));
   });
-  window.addEventListener("hashchange", route);
-  renderStats();
-  renderMultTable();
-  route();
+  $('d-back').addEventListener('click', () => showTab('board'));
+
+  const hash = window.location.hash || '';
+  const dm = hash.match(/#detail=([\w-]+)/);
+  if (dm) { showDetail(dm[1]); return; }
+  const fm = hash.match(/#filter=(.+)/);
+  if (fm) {
+    const cat = decodeURIComponent(fm[1]);
+    state.cat = cat;
+    $('f-cat').value = cat;
+    renderBoard();
+  }
 }
 
-init();
+document.addEventListener('DOMContentLoaded', init);
