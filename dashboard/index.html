@@ -3,12 +3,71 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Radar: pre-token protocols ranked by implied value</title>
+<title>Token Radar — pre-token protocols ranked by implied value</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<a class="skip" href="#board">Skip to the board</a>
-<div id="app" aria-busy="true"></div>
+<header class="masthead">
+  <div>
+    <h1>Token Radar</h1>
+    <p class="tagline">Pre-token protocols, ranked by what their token would be worth if their record stayed as it is.</p>
+  </div>
+  <div class="mast-stats">
+    <div><strong id="statRows">—</strong><span>protocols ranked</span></div>
+    <div><strong id="statTotal">—</strong><span>total implied value</span></div>
+    <div><strong id="statMedian">—</strong><span>market FDV/TVL</span></div>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button id="tabEarly" role="tab" aria-selected="true">Pre-token board</button>
+  <button id="tabLive" role="tab" aria-selected="false">Already live</button>
+</nav>
+
+<section class="controls">
+  <label>Search <input id="q" type="search" placeholder="name or slug…" autocomplete="off"></label>
+  <label>Category <select id="category"><option value="">All categories</option></select></label>
+  <label>Chain <select id="chain"><option value="">All chains</option></select></label>
+  <label class="check"><input id="watchOnly" type="checkbox"> Watchlist only</label>
+  <span id="rowCount" class="rowcount"></span>
+</section>
+
+<main>
+  <table id="board">
+    <thead><tr>
+      <th data-key="rank">Rank</th>
+      <th data-key="name">Protocol</th>
+      <th data-key="tvl_usd">TVL</th>
+      <th data-key="change_7d">7d</th>
+      <th data-key="age_days">Age</th>
+      <th data-key="multiple">Multiple</th>
+      <th data-key="implied_value_usd">Implied value</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p id="empty" class="empty" hidden>No protocol matches these filters.</p>
+</main>
+
+<aside id="drawer" hidden>
+  <button id="drawerClose" aria-label="Close detail">×</button>
+  <div id="detail"></div>
+</aside>
+
+<section class="model">
+  <h2>How the implied value is built</h2>
+  <p class="formula">implied = TVL × multiple × (1 + ½ of the 7-day TVL change, clamped to −50%…+100%) × (0.6 + age up to 3 years × 0.4) × (1 + 2% per extra chain, up to five)</p>
+  <p>The multiple is the category's own FDV/TVL: the median of its tokenized protocols' market-cap/TVL ratios, each ratio capped at 2.0× first, shrunk toward the market median with three peers' weight, capped at 1.0× and floored at 0.02×. A category with no tokenized peer takes the market median. Nothing is hardcoded by protocol name.</p>
+  <h3>Derived multiples by category</h3>
+  <table id="multiples">
+    <thead><tr><th>Category</th><th>Peers</th><th>Median ratio</th><th>Multiple used</th></tr></thead>
+    <tbody id="multipleRows"></tbody>
+  </table>
+</section>
+
+<footer>
+  <p>Implied values are this radar's own claim from the sealed snapshot (DefiLlama, <span id="asOf">—</span>). They do not predict whether or when a token is issued. Farm steps are suggestions, not advice; check every protocol yourself before moving funds.</p>
+</footer>
+
 <script src="../data.js"></script>
 <script src="app.js"></script>
 </body>
