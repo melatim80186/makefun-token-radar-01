@@ -1,67 +1,124 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Token Radar — launch value × token odds</title>
+<title>Token Radar — pre-token protocols priced off the market's own curve</title>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
-<header>
-  <p class="kicker">Token Radar · snapshot 14 Nov 2026 · 758 protocols ≥ $5M TVL</p>
-  <h1>Pre-token protocols, priced by expected value</h1>
-  <p class="lede">198 protocols record no token. Priced off the market&rsquo;s own curve, their launches would be worth <b id="totalLaunch"></b> — but a launch is only worth something if a token ever appears. This board ranks by <b>expected value</b>: launch value &times; the share of the protocol&rsquo;s category that already records a token. Total expected value: <b id="totalEv"></b>.</p>
-  <p class="strip" id="coverage"></p>
+<header class="masthead">
+  <div class="brand"><span class="mark">&#9670;</span> TOKEN RADAR</div>
+  <div class="snapline" id="snapline">Snapshot 2026-11-14 &middot; DeFiLlama protocol index</div>
+  <div class="selfcheck" id="selfcheck">checking&hellip;</div>
 </header>
 
-<section class="stats" id="stats"></section>
+<main>
+  <section class="lede">
+    <h1><span id="headlineRows">198</span> protocols record no token.
+      Priced off the market&rsquo;s own curve, their launches would be worth
+      <span id="headlineTotal">$2.00B</span>.</h1>
+    <p class="standfirst">Every protocol the snapshot tracks that records no token
+      and is nobody else&rsquo;s product, priced from the ones that do trade: a dollar
+      of TVL is worth a different multiple at $5M than at $5B, so the model fits
+      that curve on the snapshot&rsquo;s own trading protocols. An implied value is a
+      model, not a promise, and never a prediction that a token will be issued.</p>
+  </section>
 
-<nav class="tabs" aria-label="Sections">
-  <button data-tab="board" class="on">Board</button>
-  <button data-tab="model">Model</button>
-  <button data-tab="live">Already trading</button>
-</nav>
+  <section class="stats" id="stats"></section>
 
-<section id="tab-board">
-  <div class="top5" id="top5"></div>
-  <div class="filters">
-    <input id="q" type="search" placeholder="Search a protocol&hellip;" aria-label="Search protocols">
-    <select id="fcat" aria-label="Category"><option value="">All categories</option></select>
-    <select id="fchain" aria-label="Chain"><option value="">All chains</option></select>
-    <select id="fverdict" aria-label="Verdict">
-      <option value="">All verdicts</option><option>Farm</option><option>Thin</option><option>Skip</option>
-    </select>
-    <label class="watch"><input id="fwatch" type="checkbox"> Watchlist only</label>
-  </div>
-  <p class="count" id="count"></p>
-  <div class="tablewrap"><table id="board">
-    <thead><tr>
-      <th data-sort="rank">#</th><th data-sort="name">Protocol</th><th data-sort="category">Category</th>
-      <th data-sort="tvl">TVL</th><th data-sort="chg">7d</th><th data-sort="age">Age</th>
-      <th data-sort="launch">Launch value</th><th data-sort="p">P(token)</th>
-      <th data-sort="ev">Expected value</th><th data-sort="verdict">Verdict</th>
-    </tr></thead>
-    <tbody id="rows"></tbody>
-  </table></div>
-  <p class="note">Expected value = launch value &times; P(token | category). Launch value comes from the market&rsquo;s own curve (see Model). P is the observed share of the category that records a token market cap, shrunk toward the snapshot&rsquo;s global share of 0.170. This board does not predict whether or when a token is issued.</p>
-</section>
+  <section class="topfive">
+    <h2>The five biggest launches, on the curve</h2>
+    <div class="cards" id="topcards"></div>
+  </section>
 
-<section id="tab-model" hidden>
-  <h2>The model</h2>
-  <div id="model"></div>
-</section>
+  <section class="hist">
+    <div class="histhead"><span>How the board&rsquo;s implied values are distributed, log scale</span><span id="histnote"></span></div>
+    <div class="bars" id="histbars"></div>
+  </section>
 
-<section id="tab-live" hidden>
-  <h2>Already trading</h2>
-  <p id="liveNote"></p>
-  <table class="plain"><thead><tr><th>#</th><th>Protocol</th><th>Category</th><th>Market cap</th></tr></thead>
-  <tbody id="liveRows"></tbody></table>
-</section>
+  <nav class="tabs" id="tabs">
+    <button data-tab="board" class="active">Board</button>
+    <button data-tab="model">The model</button>
+    <button data-tab="live">Already trading</button>
+  </nav>
 
-<aside id="detail" hidden>
-  <button id="closeDetail" aria-label="Close detail">&times;</button>
-  <div id="detailBody"></div>
-</aside>
+  <section class="tabpage" id="tab-board">
+    <div class="filters">
+      <input id="q" type="search" placeholder="Search protocols" aria-label="Search">
+      <select id="fcat" aria-label="Category"><option value="">All categories</option></select>
+      <select id="fchain" aria-label="Chain"><option value="">All chains</option></select>
+      <select id="ftvl" aria-label="Minimum TVL">
+        <option value="0">Any TVL</option>
+        <option value="50000000">$50M+</option>
+        <option value="100000000">$100M+</option>
+        <option value="500000000">$500M+</option>
+        <option value="1000000000">$1B+</option>
+      </select>
+      <div class="pills" id="tierpills">
+        <button data-tier="all" class="active">All</button>
+        <button data-tier="watch">Watchlist</button>
+        <button data-tier="floor">Above floor</button>
+        <button data-tier="early">Early</button>
+      </div>
+      <div class="pills" id="movepills">
+        <button data-move="any" class="active">Any move</button>
+        <button data-move="gain">Gaining</button>
+        <button data-move="fall">Falling</button>
+      </div>
+      <button id="clearfilters" class="clear">Clear filters</button>
+    </div>
+    <p class="rowcount" id="rowcount"></p>
+    <table class="board" id="board">
+      <thead><tr>
+        <th data-sort="rank">#</th>
+        <th data-sort="name">Protocol</th>
+        <th data-sort="cat">Category</th>
+        <th data-sort="tvl">TVL</th>
+        <th data-sort="chg">7D</th>
+        <th data-sort="age">No token for</th>
+        <th data-sort="mult">Multiple</th>
+        <th data-sort="imp">Implied value, and the model&rsquo;s range</th>
+        <th data-sort="ticket">Farm ticket</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <p class="fineprint">Click a row for its factor breakdown and farm plan.
+      Click a column to sort. Ranks are the model&rsquo;s claim, strongest implied
+      value first.</p>
+  </section>
+
+  <section class="tabpage hidden" id="tab-model">
+    <h2>The model, in full</h2>
+    <p class="formula" id="formula"></p>
+    <div class="modelstats" id="modelstats"></div>
+    <h3>Category effects</h3>
+    <p>Each category&rsquo;s effect is the mean log-residual of its trading
+      protocols against the curve, shrunk toward the curve with 4 pseudo-comps.
+      A category with one comp keeps one-fifth of its own residual; the rest is
+      the curve. Thin evidence is shown, not hidden.</p>
+    <table class="effects" id="effectstable">
+      <thead><tr><th>Category</th><th>Comps</th><th>Raw (dex)</th><th>Shrunk (dex)</th><th>Factor</th></tr></thead>
+      <tbody id="effectstbody"></tbody>
+    </table>
+    <h3>What the model does not do</h3>
+    <ul class="notes" id="modelnotes"></ul>
+  </section>
+
+  <section class="tabpage hidden" id="tab-live">
+    <h2>Already trading</h2>
+    <p id="liveintro"></p>
+    <table class="live" id="livetable">
+      <thead><tr><th>Protocol</th><th>Category</th><th>TVL</th><th>Market cap</th></tr></thead>
+      <tbody id="livetbody"></tbody>
+    </table>
+    <p class="fineprint" id="setaside"></p>
+  </section>
+</main>
+
+<div class="detail hidden" id="detail" role="dialog" aria-modal="true">
+  <div class="panel" id="detailpanel"></div>
+</div>
 
 <script src="data.js"></script>
 <script src="app.js"></script>
